@@ -1,3 +1,6 @@
 [submodule "libs/omni-fiber"]
 	path = libs/omni-fiber
 	url = https://github.com/kghost/omni-fiber
+[submodule "libs/lcrq"]
+	path = libs/lcrq
+	url = https://git.sr.ht/~librecast/lcrq
