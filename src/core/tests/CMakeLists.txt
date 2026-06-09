@@ -17,3 +17,9 @@ target_link_libraries(udp_dyn_mux_test PRIVATE great-hole-core-asan GTest::gtest
 target_compile_options(udp_dyn_mux_test PRIVATE -fsanitize=address -fno-omit-frame-pointer)
 target_link_options(udp_dyn_mux_test PRIVATE -fsanitize=address)
 gtest_discover_tests(udp_dyn_mux_test)
+
+add_executable(lcrq_test TestLcrq.cpp)
+target_link_libraries(lcrq_test PRIVATE great-hole-core-asan lcrq GTest::gtest_main)
+target_compile_options(lcrq_test PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+target_link_options(lcrq_test PRIVATE -fsanitize=address)
+gtest_discover_tests(lcrq_test)

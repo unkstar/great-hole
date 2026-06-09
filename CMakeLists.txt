@@ -4,6 +4,10 @@ project(great-hole VERSION 0.1.0 LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# Enforce Clang compiler
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  message(FATAL_ERROR "great-hole requires Clang compiler. Current: ${CMAKE_CXX_COMPILER_ID} (${CMAKE_CXX_COMPILER})")
+endif()
 
 # set(GREAT_HOLE_PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(CMAKE_THREAD_LIBS_INIT "-lpthread")
@@ -26,4 +30,5 @@ find_package(GTest REQUIRED)
 set(OMNIFIBER_INTERNAL ON CACHE BOOL "" FORCE)
 
 add_subdirectory(libs/omni-fiber)
+add_subdirectory(libs/lcrq)
 add_subdirectory(src)

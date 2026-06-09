@@ -19,6 +19,7 @@ foreach(suffix "" "-asan")
     EndpointUdp.cpp
     EndpointUdpMux.cpp
     EndpointUdpDynMux.cpp
+    RaptorQ.cpp
   )
 
   target_include_directories(${target_core} PUBLIC
@@ -43,6 +44,7 @@ foreach(suffix "" "-asan")
     Boost::thread
     ${omnifiber}
     ${omniresolver}
+    lcrq
   )
 
   if(Boost_PROCESS_FOUND)

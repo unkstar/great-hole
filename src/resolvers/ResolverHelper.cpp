@@ -34,6 +34,9 @@ std::shared_ptr<ResolverIp> FindResolverIp(const std::string& input, ResolveFor&
   try {
     // Try to parse as static IP
     auto address = boost::asio::ip::make_address(stripped);
+    if (address.is_v4()) {
+      address = boost::asio::ip::make_address_v6(boost::asio::ip::v4_mapped_t(), address.to_v4());
+    }
     return std::make_shared<ResolverStaticIp>(address);
   } catch (const boost::system::system_error&) {
     // If not a static IP, treat as DNS host name
