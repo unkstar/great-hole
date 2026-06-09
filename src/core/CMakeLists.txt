@@ -19,6 +19,7 @@ foreach(suffix "" "-asan")
     EndpointUdp.cpp
     EndpointUdpMux.cpp
     EndpointUdpDynMux.cpp
+    FecPipeline.cpp
     RaptorQ.cpp
   )
 

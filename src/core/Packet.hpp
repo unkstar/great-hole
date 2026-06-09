@@ -86,7 +86,27 @@ public:
   std::vector<uint8_t> _Data;
   std::size_t _Offset;
   std::size_t _Length;
-// Little-endian PushFront (no byte swap on LE machines)  template <typename T>    requires std::is_integral_v<T>  void PushFrontLE(T value) {    if constexpr (std::endian::native == std::endian::big) {      PushFront(std::byteswap(value));    } else {      PushFront(value);    }  }  // Little-endian PopFront (reads raw LE bytes into value)  template <typename T>    requires std::is_integral_v<T>  T PopFrontLE() {    auto span = PopFront(sizeof(T));    T result = 0;    for (std::size_t i = 0; i < sizeof(T); i++) {      result |= static_cast<T>(span[i]) << (i * 8);    }    return result;  }
+  // Little-endian PushFront (no byte swap on LE machines)
+  template <typename T>
+    requires std::is_integral_v<T>
+  void PushFrontLE(T value) {
+    if constexpr (std::endian::native == std::endian::big) {
+      PushFront(std::byteswap(value));
+    } else {
+      PushFront(value);
+    }
+  }
+  // Little-endian PopFront (reads raw LE bytes into value)
+  template <typename T>
+    requires std::is_integral_v<T>
+  T PopFrontLE() {
+    auto span = PopFront(sizeof(T));
+    T result = 0;
+    for (std::size_t i = 0; i < sizeof(T); i++) {
+      result |= static_cast<T>(span[i]) << (i * 8);
+    }
+    return result;
+  }
 };
 
 } // namespace gh

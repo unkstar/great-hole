@@ -15,6 +15,8 @@
 #include "FilterXor.hpp"
 #include "LuaInterface.hpp"
 #include "Pipeline.hpp"
+#include "FecConfig.hpp"
+#include "FecPipeline.hpp"
 #include "ResolverCombinedEndpoint.hpp"
 #include "ResolverHelper.hpp"
 
@@ -56,6 +58,7 @@ constexpr const char name_endpoint[] = "Hole.endpoint";
 constexpr const char name_filter[] = "Hole.filter";
 constexpr const char name_udp[] = "Hole.udp";
 constexpr const char name_udp_mux_server[] = "Hole.udp-mux-server";
+constexpr const char name_fec_pipeline[] = "Hole.fec-pipeline";
 constexpr const char name_udp_dyn_mux[] = "Hole.udp-dyn-mux";
 
 template <typename T, const char N[]> static int gc(lua_State* L) {
@@ -130,7 +133,117 @@ static void pipeline_new(lua_State* L) {
   });
 }
 
+// =========================== fec_pipeline ===========================
+static void fec_pipeline_stop(lua_State* L) {
+  auto& pipe = *(std::shared_ptr<FecPipeline>*)luaL_checkudata(L, 1, name_fec_pipeline);
+  auto& interface = *(LuaInterface*)lua_touserdata(L, lua_upvalueindex(1));
+
+  interface.Schedule([&interface, pipe](this auto self, lua_State* L, int nres) -> Omni::Fiber::Coroutine<int> {
+    co_await pipe->Stop();
+    co_return 0;
+  });
+}
+
+static auto fec_pipeline_metatable = std::to_array<const struct luaL_Reg>({
+    {.name = "__gc", .func = safe_call<gc<FecPipeline, name_fec_pipeline>>},
+    {.name = "stop", .func = safe_yield<fec_pipeline_stop>},
+    {.name = NULL, .func = NULL},
+});
+
+static void fec_pipeline_new(lua_State* L) {
+  auto c = lua_gettop(L);
+  if (c < 3) {
+    throw std::runtime_error("fec_pipeline: not enough arguments");
+  }
+
+  auto& interface = *(LuaInterface*)lua_touserdata(L, lua_upvalueindex(1));
+
+  std::shared_ptr<EndpointInput> in = *(std::shared_ptr<Endpoint>*)luaL_checkudata(L, 1, name_endpoint);
+
+  // Parse filters from table at index 2
+  luaL_checktype(L, 2, LUA_TTABLE);
+  std::vector<std::shared_ptr<Filter>> filters;
+  int filter_count = (int)lua_rawlen(L, 2);
+  for (int i = 1; i <= filter_count; i++) {
+    lua_rawgeti(L, 2, i);
+    filters.push_back(*(std::shared_ptr<Filter>*)luaL_checkudata(L, -1, name_filter));
+    lua_pop(L, 1);
+  }
+
+  std::shared_ptr<EndpointOutput> out = *(std::shared_ptr<Endpoint>*)luaL_checkudata(L, 3, name_endpoint);
+
+  // Parse FecConfig from table at index 4 (optional)
+  FecConfig cfg;
+  bool is_encoder = true;
+  if (c >= 4 && lua_istable(L, 4)) {
+    lua_getfield(L, 4, "timeout_ms");
+    if (lua_isinteger(L, -1)) cfg.timeout_ms = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "overhead");
+    if (lua_isnumber(L, -1)) cfg.overhead = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "max_overhead");
+    if (lua_isnumber(L, -1)) cfg.max_overhead = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "repeat_ratio");
+    if (lua_isnumber(L, -1)) cfg.repeat_ratio = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "symbol_size");
+    if (lua_isinteger(L, -1)) cfg.symbol_size = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "mtu");
+    if (lua_isinteger(L, -1)) cfg.mtu = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "max_batch");
+    if (lua_isinteger(L, -1)) cfg.max_batch = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "obfuscate");
+    if (lua_isboolean(L, -1)) cfg.obfuscate = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "iv_len");
+    if (lua_isinteger(L, -1)) cfg.iv_len = (uint8_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "decode_window");
+    if (lua_isinteger(L, -1)) cfg.decode_window = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "ping_interval_ms");
+    if (lua_isinteger(L, -1)) cfg.ping_interval_ms = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "feedback_timeout_ms");
+    if (lua_isinteger(L, -1)) cfg.feedback_timeout_ms = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "feedback_stale_ms");
+    if (lua_isinteger(L, -1)) cfg.feedback_stale_ms = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "ping_loss_threshold");
+    if (lua_isinteger(L, -1)) cfg.ping_loss_threshold = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "decode_timeout_ms");
+    if (lua_isinteger(L, -1)) cfg.decode_timeout_ms = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "is_encoder");
+    if (lua_isboolean(L, -1)) is_encoder = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+  }
+  if (c >= 5 && lua_isboolean(L, 5)) {
+    is_encoder = lua_toboolean(L, 5);
+  }
+
+  auto pipe = new (lua_newuserdata(L, sizeof(std::shared_ptr<FecPipeline>)))
+      std::shared_ptr<FecPipeline>(new FecPipeline(interface.GetContext(), in, filters, out, cfg, is_encoder));
+  luaL_getmetatable(L, name_fec_pipeline);
+  lua_setmetatable(L, -2);
+
+  interface.Schedule([&interface, pipe](this auto self, lua_State* L, int nres) -> Omni::Fiber::Coroutine<int> {
+    ErrorCode err = co_await (*pipe)->Start();
+    if (err) {
+      throw boost::system::system_error(err, "fec_pipeline start error");
+    }
+    co_return 1;
+  });
+}
 static void endpoint_stop(lua_State* L) {
+
   auto& ep = *(std::shared_ptr<Endpoint>*)luaL_checkudata(L, 1, name_endpoint);
   auto& interface = *(LuaInterface*)lua_touserdata(L, lua_upvalueindex(1));
 
@@ -447,6 +560,7 @@ static auto hole_io_object = std::to_array<const struct luaL_Reg>({
     {.name = "tun", .func = safe_yield<tun_new>},
     {.name = "udp", .func = safe_yield<udp_new>},
     {.name = "udp_mux_server", .func = safe_yield<udp_mux_server_new>},
+    {.name = "fec_pipeline", .func = safe_yield<fec_pipeline_new>},
     {.name = "udp_dyn_mux", .func = safe_yield<udp_dyn_mux_new>},
     {.name = NULL, .func = NULL},
 });
@@ -494,6 +608,12 @@ static int hole_open(lua_State* L) {
   lua_setfield(L, -2, "__index"); /* metatable.__index = metatable */
   lua_pushlightuserdata(L, &interface);
   luaL_setfuncs(L, pipeline_metatable.data(), 1);
+  luaL_newmetatable(L, name_fec_pipeline);
+  lua_pushvalue(L, -1);
+  lua_setfield(L, -2, "__index");
+  lua_pushlightuserdata(L, &interface);
+  luaL_setfuncs(L, fec_pipeline_metatable.data(), 1);
+  lua_pop(L, 1);
   lua_pop(L, 1);
 
   luaL_newmetatable(L, name_filter);
