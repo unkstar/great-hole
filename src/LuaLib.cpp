@@ -117,7 +117,7 @@ static void pipeline_new(lua_State* L) {
   std::shared_ptr<EndpointOutput> out = *(std::shared_ptr<Endpoint>*)luaL_checkudata(L, c, name_endpoint);
 
   auto pipe = new (lua_newuserdata(L, sizeof(std::shared_ptr<Pipeline>)))
-      std::shared_ptr<Pipeline>(new Pipeline(in, filters, out));
+      std::shared_ptr<Pipeline>(new Pipeline(interface.GetContext(), in, filters, out));
   luaL_getmetatable(L, name_pipeline);
   lua_setmetatable(L, -2);
 
