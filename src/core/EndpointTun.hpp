@@ -12,6 +12,7 @@ public:
   Tun(boost::asio::io_context& io_context, std::string const& name);
 
   Omni::Fiber::Coroutine<ErrorCode> Read(Packet& p, Cancel&) override;
+  ErrorCode TryRead(Packet& p) override;
   Omni::Fiber::Coroutine<ErrorCode> Write(Packet& p, Cancel&) override;
 
 protected:

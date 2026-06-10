@@ -52,89 +52,43 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
     auto& fiber = co_await Omni::Fiber::GetCurrentFiber();
 
     if (_IsEncoder) {
-        // ============ ENCODE PATH ============
-        while (!_Stop.IsTriggered()) {
-            // --- Accumulate batch ---
-            std::vector<Packet> batch;
+        auto batch_queue = std::make_shared<std::vector<Packet>>();
+        auto reader_done = std::make_shared<bool>(false);
 
-            // Read first packet (blocking)
-            {
+        fiber.Spawn("fec-reader", [this, batch_queue, reader_done]() -> Omni::Fiber::Coroutine<void> {
+            while (!_Stop.IsTriggered()) {
                 Packet p;
                 auto err = co_await _In->Read(p, _Stop);
                 if (err) {
-                    if (err == ErrorCode{AppErrorCategory::kOperationAborted, kAppError}) {
-                        continue;
-                    }
-                    if (err == ErrorCode{AppErrorCategory::kEndOfStream, kAppError}) {
-                        break;
-                    }
-                    if (IsCritical(err)) {
-                        BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") read error: " << err.message();
-                        throw SystemError(err, "FecPipeline read error");
-                    }
-                    BOOST_LOG_TRIVIAL(warning) << "FecPipeline(" << this
-                                               << ") read warning: " << err.message();
-                    continue;
+                    if (err == ErrorCode{AppErrorCategory::kEndOfStream, kAppError}) { *reader_done = true; break; }
+                    if (err == ErrorCode{AppErrorCategory::kOperationAborted, kAppError}) continue;
+                    if (IsCritical(err)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline read error: " << err.message(); throw SystemError(err, "FecPipeline read error"); }
+                    BOOST_LOG_TRIVIAL(warning) << "FecPipeline read warning: " << err.message(); continue;
                 }
-                batch.push_back(std::move(p));
-            }
-
-            // Accumulate remaining packets with timeout
-            if (batch.size() < _Cfg.max_batch) {
-                auto batch_cancel = std::make_shared<Cancel>();
-                std::shared_ptr<boost::asio::steady_timer> timer;
-
-                if (_Cfg.timeout_ms > 0) {
-                    timer = std::make_shared<boost::asio::steady_timer>(_Io);
-                    timer->expires_after(std::chrono::milliseconds(_Cfg.timeout_ms));
-
-                    fiber.Spawn("fec-timer", [timer, batch_cancel]() -> Omni::Fiber::Coroutine<void> {
-                        co_await timer->async_wait(Omni::Fiber::AsioUseFiber);
-                        batch_cancel->Trigger();
-                    });
-                }
-
-                while (batch.size() < _Cfg.max_batch && !_Stop.IsTriggered()) {
-                    Packet p;
-                    Cancel& read_cancel = timer ? *batch_cancel : _Stop;
-                    auto err = co_await _In->Read(p, read_cancel);
-                    if (err) {
-                        break;
+                if (_Filters.empty()) {
+                    batch_queue->push_back(std::move(p));
+                    while (batch_queue->size() < _Cfg.max_batch && !_Stop.IsTriggered()) {
+                        Packet p2; if (_In->TryRead(p2)) break;
+                        batch_queue->push_back(std::move(p2));
                     }
-                    batch.push_back(std::move(p));
-                }
-
-                if (timer) {
-                    timer->cancel();
+                } else {
+                    for (auto& f : _Filters) { auto fe = co_await f->Pipe(p, _Stop); if (fe) { if (fe == ErrorCode{AppErrorCategory::kOperationAborted, kAppError}) break; if (IsCritical(fe)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline filter error: " << fe.message(); throw SystemError(fe, "FecPipeline filter error"); } break; } }
+                    batch_queue->push_back(std::move(p));
                 }
             }
+        });
 
-            if (batch.empty() || _Stop.IsTriggered()) {
-                continue;
+        while (!_Stop.IsTriggered()) {
+            auto timer = std::make_shared<boost::asio::steady_timer>(_Io);
+            timer->expires_after(std::chrono::milliseconds(_Cfg.timeout_ms));
+            co_await timer->async_wait(Omni::Fiber::AsioUseFiber);
+            if (!batch_queue->empty() && !_Stop.IsTriggered()) {
+                std::vector<Packet> batch; size_t n = std::min(batch_queue->size(), (size_t)_Cfg.max_batch);
+                batch.reserve(n); std::move(batch_queue->begin(), batch_queue->begin()+n, std::back_inserter(batch));
+                batch_queue->erase(batch_queue->begin(), batch_queue->begin()+n);
+                co_await SendBatch(batch);
             }
-
-            // --- Apply filters ---
-            for (auto& pkt : batch) {
-                for (auto& f : _Filters) {
-                    auto err = co_await f->Pipe(pkt, _Stop);
-                    if (err) {
-                        if (err == ErrorCode{AppErrorCategory::kOperationAborted, kAppError}) {
-                            break;
-                        }
-                        if (IsCritical(err)) {
-                            BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this
-                                                     << ") filter error: " << err.message();
-                            throw SystemError(err, "FecPipeline filter error");
-                        }
-                        BOOST_LOG_TRIVIAL(warning) << "FecPipeline(" << this
-                                                   << ") filter warning: " << err.message();
-                        break;
-                    }
-                }
-            }
-
-            // --- Send batch ---
-            co_await SendBatch(batch);
+            if (*reader_done && batch_queue->empty()) break;
         }
     } else {
         // ============ DECODE PATH ============
@@ -344,7 +298,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
 
         for (uint32_t i = 0; i < copies && !_Stop.IsTriggered(); i++) {
             Packet out;
-
+            out._Length = 0;
             // Copy packet data
             out.PushBack(pkt.Data());
 
@@ -422,7 +376,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
             auto* sym_data = rq.GenerateSymbol(esi);
 
             Packet out;
-
+            out._Length = 0;
             // Push symbol data
             out.PushBack(std::span<const uint8_t>(sym_data, T));
 
