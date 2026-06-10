@@ -14,7 +14,7 @@ namespace gh {
 class Packet final {
 public:
   static constexpr const std::size_t kCapacity = 2048;
-  static constexpr const std::size_t kReservedFront = 2;
+  static constexpr const std::size_t kReservedFront = 32;
 
   explicit Packet(const std::size_t length = kCapacity, const std::size_t offset = kReservedFront)
       : _Data(length + offset), _Offset(offset), _Length(length) {}
@@ -93,7 +93,7 @@ public:
     if constexpr (std::endian::native == std::endian::big) {
       PushFront(std::byteswap(value));
     } else {
-      PushFront(value);
+      PushFront(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&value), sizeof(value)));
     }
   }
   // Little-endian PopFront (reads raw LE bytes into value)

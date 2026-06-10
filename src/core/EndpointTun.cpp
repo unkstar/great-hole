@@ -61,4 +61,20 @@ Omni::Fiber::Coroutine<ErrorCode> Tun::Write(Packet& p, Cancel& c) {
   co_return err;
 }
 
+
+ErrorCode Tun::TryRead(Packet& p) {
+  ssize_t n = ::read(_TunFileDescriptor.native_handle(), p._Data.data() + p._Offset, p._Length);
+  if (n > 0) {
+    p._Length = static_cast<std::size_t>(n);
+    return ErrorCode{};
+  }
+  if (n == 0) {
+    return ErrorCode{AppErrorCategory::kEndOfStream, kAppError};
+  }
+  if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    return ErrorCode{AppErrorCategory::kOperationAborted, kAppError};
+  }
+  return ErrorCode(errno, system_category());
+}
+
 } // namespace gh

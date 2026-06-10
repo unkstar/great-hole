@@ -12,6 +12,7 @@ namespace gh {
 class EndpointInput : virtual public Service {
 public:
   virtual ~EndpointInput() = 0;
+  virtual ErrorCode TryRead(Packet&) { return ErrorCode{AppErrorCategory::kOperationAborted, kAppError}; }
   virtual Omni::Fiber::Coroutine<ErrorCode> Read(Packet&, Cancel&) = 0;
   virtual PipielineUsageCounter& GetPipielineUsageCounter() = 0;
 };
