@@ -99,6 +99,7 @@ public:
 
   Omni::Fiber::Coroutine<ErrorCode> Read(Packet& p, Cancel& c) override;
   Omni::Fiber::Coroutine<ErrorCode> Write(Packet& p, Cancel& c) override;
+  Omni::Fiber::Coroutine<ErrorCode> WriteBatch(std::vector<Packet>& pkts, Cancel& c) override;
 
 protected:
   std::string GetName() const override;
