@@ -63,18 +63,19 @@ Omni::Fiber::Coroutine<ErrorCode> Tun::Write(Packet& p, Cancel& c) {
 
 
 ErrorCode Tun::TryRead(Packet& p) {
-  ssize_t n = ::read(_TunFileDescriptor.native_handle(), p._Data.data() + p._Offset, p._Length);
-  if (n > 0) {
-    p._Length = static_cast<std::size_t>(n);
-    return ErrorCode{};
+  boost::system::error_code ec;
+  std::size_t n = _TunFileDescriptor.read_some(boost::asio::mutable_buffer(p), ec);
+  if (ec) {
+    if (ec == boost::asio::error::would_block || ec == boost::asio::error::try_again) {
+      return ErrorCode{AppErrorCategory::kOperationAborted, kAppError};
+    }
+    if (ec == boost::asio::error::eof) {
+      return ErrorCode{AppErrorCategory::kEndOfStream, kAppError};
+    }
+    return ErrorCode(ec.value(), system_category());
   }
-  if (n == 0) {
-    return ErrorCode{AppErrorCategory::kEndOfStream, kAppError};
-  }
-  if (errno == EAGAIN || errno == EWOULDBLOCK) {
-    return ErrorCode{AppErrorCategory::kOperationAborted, kAppError};
-  }
-  return ErrorCode(errno, system_category());
+  p._Length = n;
+  return ErrorCode{};
 }
 
 } // namespace gh

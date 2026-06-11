@@ -146,20 +146,26 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
             }
 
             if (is_repeat) {
-                // REPEAT: [IV:1~8B][XORed raw packet]
-                uint8_t iv_len = (f >> 1) & 0x07;
-                if (iv_len > 0 && _Cfg.obfuscate) {
-                    if (p.DataSize() < iv_len) continue;
-                    auto iv_span = p.PopFront(iv_len);
-                    for (size_t i = 0; i < p.DataSize(); i++) {
-                        p._Data[p._Offset + i] ^= iv_span[i % iv_len];
-                    }
+                bool seen = false;
+                for (size_t ri = 0; ri < _RingBuffer.size(); ri++) {
+                    if (_RingBuffer[ri].group_seq == group_seq) { seen = true; break; }
                 }
-                auto err_write = co_await _Out->Write(p, _Stop);
-                if (err_write && IsCritical(err_write)) {
-                    BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this
-                                             << ") write error: " << err_write.message();
-                    throw SystemError(err_write, "FecPipeline write error");
+                if (!seen) {
+                    auto& rslot = FindSlot(group_seq); rslot.group_seq = group_seq;
+                    uint8_t iv_len = (f >> 1) & 0x07;
+                    if (iv_len > 0 && _Cfg.obfuscate) {
+                        if (p.DataSize() < iv_len) continue;
+                        auto iv_span = p.PopFront(iv_len);
+                        for (size_t i = 0; i < p.DataSize(); i++) {
+                            p._Data[p._Offset + i] ^= iv_span[i % iv_len];
+                        }
+                    }
+                    auto err_write = co_await _Out->Write(p, _Stop);
+                    if (err_write && IsCritical(err_write)) {
+                        BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this
+                                                 << ") write error: " << err_write.message();
+                        throw SystemError(err_write, "FecPipeline write error");
+                    }
                 }
                 continue;
             }
@@ -249,7 +255,8 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                         if (pos + pkt_len > decoded.size()) break;
 
                         Packet out;
-            out._Length = 0;
+                        out._Length = 0;
+                        out._Length = 0;
                                     out.PushBack(std::span<const uint8_t>(decoded.data() + pos, pkt_len));
                         pos += pkt_len;
 
@@ -299,7 +306,8 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
 
         for (uint32_t i = 0; i < copies && !_Stop.IsTriggered(); i++) {
             Packet out;
-            out._Length = 0;
+                        out._Length = 0;
+                        out._Length = 0;
             // Copy packet data
             out.PushBack(pkt.Data());
 
@@ -377,7 +385,8 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
             auto* sym_data = rq.GenerateSymbol(esi);
 
             Packet out;
-            out._Length = 0;
+                        out._Length = 0;
+                        out._Length = 0;
             // Push symbol data
             out.PushBack(std::span<const uint8_t>(sym_data, T));
 
