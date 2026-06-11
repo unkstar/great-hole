@@ -256,7 +256,6 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
 
                         Packet out;
                         out._Length = 0;
-                        out._Length = 0;
                                     out.PushBack(std::span<const uint8_t>(decoded.data() + pos, pkt_len));
                         pos += pkt_len;
 
@@ -304,9 +303,9 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
             }
         }
 
+        std::vector<Packet> out_batch;
         for (uint32_t i = 0; i < copies && !_Stop.IsTriggered(); i++) {
             Packet out;
-                        out._Length = 0;
                         out._Length = 0;
             // Copy packet data
             out.PushBack(pkt.Data());
@@ -326,7 +325,10 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
             uint32_t repeat_dw = (group_seq & 0xFFFFFF) | static_cast<uint32_t>(flags | kRepeat) << 24;
             out.PushFrontLE(repeat_dw);
 
-            auto err = co_await _Out->Write(out, _Stop);
+            out_batch.push_back(std::move(out));
+        }
+        if (!out_batch.empty()) {
+            auto err = co_await _Out->WriteBatch(out_batch, _Stop);
             if (err && IsCritical(err)) {
                 BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") REPEAT write error: " << err.message();
                 throw SystemError(err, "FecPipeline REPEAT write error");
@@ -381,11 +383,11 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
 
         uint32_t final_dw = BuildDword(group_seq, final_flags);
 
+        std::vector<Packet> out_batch;
         for (uint32_t esi = 0; esi < total_symbols && !_Stop.IsTriggered(); esi++) {
             auto* sym_data = rq.GenerateSymbol(esi);
 
             Packet out;
-                        out._Length = 0;
                         out._Length = 0;
             // Push symbol data
             out.PushBack(std::span<const uint8_t>(sym_data, T));
@@ -411,8 +413,10 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
             out.PushFrontLE(final_dw);
 
             delete[] sym_data;
-
-            auto err = co_await _Out->Write(out, _Stop);
+            out_batch.push_back(std::move(out));
+        }
+        if (!out_batch.empty()) {
+            auto err = co_await _Out->WriteBatch(out_batch, _Stop);
             if (err && IsCritical(err)) {
                 BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") FEC write error: " << err.message();
                 throw SystemError(err, "FecPipeline FEC write error");
