@@ -249,7 +249,8 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                         if (pos + pkt_len > decoded.size()) break;
 
                         Packet out;
-                        out.PushBack(std::span<const uint8_t>(decoded.data() + pos, pkt_len));
+            out._Length = 0;
+                                    out.PushBack(std::span<const uint8_t>(decoded.data() + pos, pkt_len));
                         pos += pkt_len;
 
                         auto err_write = co_await _Out->Write(out, _Stop);

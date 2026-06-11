@@ -294,6 +294,8 @@ Omni::Fiber::Coroutine<ErrorCode> UdpDynMux::DoStart() {
     _Socket.open(boost::asio::ip::udp::v6());
     _Socket.set_option(boost::asio::ip::v6_only(false));
     _Socket.bind(_Local);
+  _Socket.set_option(boost::asio::socket_base::send_buffer_size(4 * 1024 * 1024));
+  _Socket.set_option(boost::asio::socket_base::receive_buffer_size(4 * 1024 * 1024));
     _Local = _Socket.local_endpoint();
     BOOST_LOG_TRIVIAL(info) << GetName() << " bound at " << _Local;
   } catch (const SystemError& e) {
