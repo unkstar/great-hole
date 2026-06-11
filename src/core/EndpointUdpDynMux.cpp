@@ -214,6 +214,36 @@ Omni::Fiber::Coroutine<ErrorCode> UdpDynMux::Channel::Write(Packet& p, Cancel& c
 
   co_return co_await _Parent.WriteTo(_Peer.value(), p, c);
 }
+Omni::Fiber::Coroutine<ErrorCode> UdpDynMux::Channel::WriteBatch(std::vector<Packet>& pkts, Cancel& c) {
+  if (c.IsTriggered() || ServiceBase::_State != ServiceBase::State::kRunning)
+    co_return ErrorCode{AppErrorCategory::kOperationAborted, kAppError};
+  if (_State != State::kRunning)
+    co_return ErrorCode{AppErrorCategory::kInvalidPacketSession, kAppError};
+  if (!_Peer.has_value() || _RemoteRxId == 0)
+    co_return ErrorCode{AppErrorCategory::kInvalidPacketSession, kAppError};
+  auto data = std::make_shared<std::vector<Packet>>(std::move(pkts));
+  if (data->empty()) co_return ErrorCode{};
+  for (size_t i = 0; i + 1 < data->size(); i++) {
+    auto& p = (*data)[i];
+    if (p._Offset < 2) continue;
+    p.PushFront(_RemoteRxId);
+    _Parent._Socket.async_send_to(boost::asio::const_buffer(p), _Peer.value(),
+        [data](boost::system::error_code, std::size_t) {});
+  }
+  auto& last = data->back();
+  if (last._Offset >= 2) {
+    last.PushFront(_RemoteRxId);
+    auto [err, n] = co_await _Parent._Socket.async_send_to(
+        boost::asio::const_buffer(last), _Peer.value(),
+        boost::asio::bind_cancellation_slot(c.AsioSlot().Slot(), Omni::Fiber::AsioUseFiber));
+    if (err) {
+      if (err == boost::asio::error::operation_aborted)
+        co_return ErrorCode{AppErrorCategory::kOperationAborted, kAppError};
+      co_return ErrorCode(err.value(), system_category());
+    }
+  }
+  co_return ErrorCode{};
+}
 
 Omni::Fiber::Coroutine<UdpDynMux::Channel::State>
 UdpDynMux::Channel::HandleControlPacket(boost::asio::ip::udp::endpoint peer, Packet& packet) {

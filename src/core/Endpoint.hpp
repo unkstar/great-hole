@@ -21,6 +21,10 @@ class EndpointOutput : virtual public Service {
 public:
   virtual ~EndpointOutput() = 0;
   virtual Omni::Fiber::Coroutine<ErrorCode> Write(Packet&, Cancel&) = 0;
+  virtual Omni::Fiber::Coroutine<ErrorCode> WriteBatch(std::vector<Packet>& pkts, Cancel& c) {
+    for (auto& p : pkts) { auto err = co_await Write(p, c); if (err) co_return err; }
+    co_return ErrorCode{};
+  }
   virtual PipielineUsageCounter& GetPipielineUsageCounter() = 0;
 };
 
