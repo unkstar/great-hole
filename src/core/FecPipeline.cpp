@@ -23,8 +23,9 @@ namespace gh {
 
 FecPipeline::FecPipeline(boost::asio::io_context& io, std::shared_ptr<EndpointInput> in,
                          const std::vector<std::shared_ptr<Filter>>& filters, std::shared_ptr<EndpointOutput> out,
-                         FecConfig cfg, bool is_encoder)
-    : Pipeline(io, in, filters, out), _Cfg(cfg), _IsEncoder(is_encoder) {
+                         FecConfig cfg, bool is_encoder,
+                         std::shared_ptr<FecSharedState> shared)
+    : Pipeline(io, in, filters, out), _Cfg(cfg), _IsEncoder(is_encoder), _Shared(std::move(shared)) {
     if (!is_encoder) {
         uint32_t window = static_cast<uint32_t>(std::bit_ceil(cfg.decode_window));
         _RingBuffer.resize(window);
@@ -79,9 +80,33 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
         });
 
         while (!_Stop.IsTriggered()) {
-            auto timer = std::make_shared<boost::asio::steady_timer>(_Io);
-            timer->expires_after(std::chrono::milliseconds(_Cfg.timeout_ms));
-            co_await timer->async_wait(Omni::Fiber::AsioUseFiber);
+            if (batch_queue->empty()) {
+                auto timer = std::make_shared<boost::asio::steady_timer>(_Io);
+                timer->expires_after(std::chrono::milliseconds(_Cfg.timeout_ms));
+                co_await timer->async_wait(Omni::Fiber::AsioUseFiber);
+            }
+
+            // Send PING periodically for RTT measurement
+            if (_Shared && _Cfg.ping_interval_ms > 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - _LastPingTime).count();
+                if (_LastPingTime.time_since_epoch().count() == 0 || elapsed >= _Cfg.ping_interval_ms) {
+                    _LastPingTime = now;
+                    auto now_us = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            now.time_since_epoch()).count());
+                    co_await SendPing(now_us);
+                }
+            }
+
+            // Send pending FEEDBACK (echo from remote PING)
+            if (_Shared && _Shared->pending_feedback_echo != 0) {
+                uint64_t echo = _Shared->pending_feedback_echo;
+                _Shared->pending_feedback_echo = 0;
+                co_await SendFeedback(echo);
+            }
+
             if (!batch_queue->empty() && !_Stop.IsTriggered()) {
                 std::vector<Packet> batch; size_t n = std::min(batch_queue->size(), (size_t)_Cfg.max_batch);
                 batch.reserve(n); std::move(batch_queue->begin(), batch_queue->begin()+n, std::back_inserter(batch));
@@ -136,12 +161,29 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                 // PING: remaining 8B is payload (echo timestamp)
                 if (p.DataSize() >= 8) {
                     uint64_t ping_echo = p.PopFrontLE<uint64_t>();
-                    _PendingEcho = ping_echo;
+                    if (_Shared) {
+                        _Shared->pending_feedback_echo = ping_echo;
+                    }
                 }
                 continue;
             }
 
             if (is_feedback) {
+                // FEEDBACK: echo was already parsed from header (kEcho flag)
+                if (has_echo && _Shared) {
+                    auto now_us = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                    uint64_t rtt_us = (now_us > echo) ? (now_us - echo) : 0;
+                    if (rtt_us > 0) {
+                        // EWMA: new = 7/8 * old + 1/8 * measured
+                        if (_Shared->rtt_ewma_us == 0) {
+                            _Shared->rtt_ewma_us = rtt_us;
+                        } else {
+                            _Shared->rtt_ewma_us = (_Shared->rtt_ewma_us * 7 + rtt_us) / 8;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -244,13 +286,19 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                         slot = RingSlot{};
                         continue;
                     }
-                    uint32_t pkt_count = 0;
-                    std::memcpy(&pkt_count, decoded.data() + pos, 4);
+                    // Read count as explicit little-endian
+                    uint32_t pkt_count =
+                        static_cast<uint32_t>(decoded[pos]) |
+                        (static_cast<uint32_t>(decoded[pos + 1]) << 8) |
+                        (static_cast<uint32_t>(decoded[pos + 2]) << 16) |
+                        (static_cast<uint32_t>(decoded[pos + 3]) << 24);
                     pos += 4;
 
                     for (uint32_t i = 0; i < pkt_count && pos + 2 <= decoded.size(); i++) {
-                        uint16_t pkt_len = 0;
-                        std::memcpy(&pkt_len, decoded.data() + pos, 2);
+                        // Read len as explicit little-endian
+                        uint16_t pkt_len =
+                            static_cast<uint16_t>(decoded[pos]) |
+                            (static_cast<uint16_t>(decoded[pos + 1]) << 8);
                         pos += 2;
                         if (pos + pkt_len > decoded.size()) break;
 
@@ -384,13 +432,16 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
         uint32_t final_dw = BuildDword(group_seq, final_flags);
 
         std::vector<Packet> out_batch;
+        auto sym_buf = std::make_unique<uint8_t[]>(T);
         for (uint32_t esi = 0; esi < total_symbols && !_Stop.IsTriggered(); esi++) {
-            auto* sym_data = rq.GenerateSymbol(esi);
+            if (!rq.GenerateSymbol(esi, sym_buf.get())) {
+                throw std::runtime_error("RaptorQ: GenerateSymbol failed for ESI " + std::to_string(esi));
+            }
 
             Packet out;
                         out._Length = 0;
             // Push symbol data
-            out.PushBack(std::span<const uint8_t>(sym_data, T));
+            out.PushBack(std::span<const uint8_t>(sym_buf.get(), T));
 
             // XOR obfuscate
             if (!iv.empty()) {
@@ -412,7 +463,6 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
             out.PushFrontLE(static_cast<uint8_t>(0)); // fb = 0
             out.PushFrontLE(final_dw);
 
-            delete[] sym_data;
             out_batch.push_back(std::move(out));
         }
         if (!out_batch.empty()) {
@@ -431,19 +481,66 @@ void FecPipeline::BuildBlob(const std::vector<Packet>& batch, std::vector<uint8_
     blob.clear();
 
     uint32_t count = static_cast<uint32_t>(batch.size());
-    blob.resize(4);
-    std::memcpy(blob.data(), &count, 4);
+    // Write count as explicit little-endian
+    blob.push_back(static_cast<uint8_t>(count & 0xFF));
+    blob.push_back(static_cast<uint8_t>((count >> 8) & 0xFF));
+    blob.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
+    blob.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
 
     for (auto& pkt : batch) {
         uint16_t len = static_cast<uint16_t>(pkt.DataSize());
-        size_t pos = blob.size();
-        blob.resize(pos + 2);
-        std::memcpy(blob.data() + pos, &len, 2);
+        // Write len as explicit little-endian
+        blob.push_back(static_cast<uint8_t>(len & 0xFF));
+        blob.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
 
-        pos = blob.size();
+        size_t pos = blob.size();
         blob.resize(pos + len);
         std::memcpy(blob.data() + pos, pkt.Data().data(), len);
     }
+}
+
+// ==================== Control Packet Senders ====================
+
+Omni::Fiber::Coroutine<void> FecPipeline::SendPing(uint64_t timestamp_us) {
+    Packet out;
+    out._Length = 0;
+
+    // Wire format: DWORD(flags|kPing) + fb(0) + ping_payload(timestamp, 8B)
+    uint8_t flags = BuildFlags() | kPing;
+    uint32_t dw = BuildDword(++_GroupSeq, flags);
+
+    out.PushFrontLE(timestamp_us);                  // ping payload
+    out.PushFrontLE(static_cast<uint8_t>(0));       // fb = 0
+    out.PushFrontLE(dw);                            // DWORD header
+
+    auto err = co_await _Out->Write(out, _Stop);
+    if (err && IsCritical(err)) {
+        BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this
+                                 << ") SendPing write error: " << err.message();
+        throw SystemError(err, "FecPipeline SendPing write error");
+    }
+    co_return;
+}
+
+Omni::Fiber::Coroutine<void> FecPipeline::SendFeedback(uint64_t echo_us) {
+    Packet out;
+    out._Length = 0;
+
+    // Wire format: DWORD(flags|kFeedback|kEcho) + fb(0) + echo(8B)
+    uint8_t flags = BuildFlags() | kFeedback | kEcho;
+    uint32_t dw = BuildDword(++_GroupSeq, flags);
+
+    out.PushFrontLE(echo_us);                       // echo timestamp
+    out.PushFrontLE(static_cast<uint8_t>(0));       // fb = 0
+    out.PushFrontLE(dw);                            // DWORD header
+
+    auto err = co_await _Out->Write(out, _Stop);
+    if (err && IsCritical(err)) {
+        BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this
+                                 << ") SendFeedback write error: " << err.message();
+        throw SystemError(err, "FecPipeline SendFeedback write error");
+    }
+    co_return;
 }
 
 // ==================== Decode Helpers ====================
@@ -466,8 +563,9 @@ FecPipeline::RingSlot& FecPipeline::FindSlot(uint32_t group_seq) {
 bool FecPipeline::EvictStaleSlot() {
     auto now = std::chrono::steady_clock::now();
     uint64_t decode_timeout = _Cfg.decode_timeout_ms;
-    if (_RttEwma > 0) {
-        uint64_t rtt_based = (3 * _RttEwma / 8) + _Cfg.timeout_ms;
+    if (_Shared && _Shared->rtt_ewma_us > 0) {
+        uint64_t rtt_ms = _Shared->rtt_ewma_us / 1000;
+        uint64_t rtt_based = (3 * rtt_ms / 8) + _Cfg.timeout_ms;
         decode_timeout = std::max(rtt_based, static_cast<uint64_t>(50));
     }
 
