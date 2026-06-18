@@ -10,11 +10,25 @@
 
 namespace gh {
 
+// Shared state between encoder and decoder on the same side.
+// Used for PING/FEEDBACK loop and RTT measurement.
+struct FecSharedState {
+    // Decoder writes when PING received, encoder reads & sends FEEDBACK then clears
+    uint64_t pending_feedback_echo = 0;
+    // Decoder updates when FEEDBACK received (RTT EWMA in microseconds)
+    uint64_t rtt_ewma_us = 0;
+    // Encoder writes timestamp of last sent PING
+    uint64_t last_ping_sent_us = 0;
+    // Consecutive PINGs lost (encoder increments on timeout)
+    uint32_t consecutive_ping_lost = 0;
+};
+
 class FecPipeline : public Pipeline {
 public:
     FecPipeline(boost::asio::io_context& io, std::shared_ptr<EndpointInput> in,
                 const std::vector<std::shared_ptr<Filter>>& filters,
-                std::shared_ptr<EndpointOutput> out, FecConfig cfg, bool is_encoder);
+                std::shared_ptr<EndpointOutput> out, FecConfig cfg, bool is_encoder,
+                std::shared_ptr<FecSharedState> shared = nullptr);
     ~FecPipeline() override = default;
 
 protected:
@@ -38,6 +52,8 @@ private:
     // Encode helpers
     Omni::Fiber::Coroutine<void> SendBatch(std::vector<Packet>& batch);
     void BuildBlob(const std::vector<Packet>& batch, std::vector<uint8_t>& blob);
+    Omni::Fiber::Coroutine<void> SendPing(uint64_t timestamp_us);
+    Omni::Fiber::Coroutine<void> SendFeedback(uint64_t echo_us);
 
     // Decode helpers
     struct RingSlot {
@@ -65,10 +81,10 @@ private:
 
     // Encode state
     uint32_t _GroupSeq = 0;
+    std::chrono::steady_clock::time_point _LastPingTime;
 
-    // Decode state
-    uint64_t _PendingEcho = 0;
-    uint64_t _RttEwma = 0;
+    // Shared state between encoder and decoder (PING/FEEDBACK)
+    std::shared_ptr<FecSharedState> _Shared;
 };
 
 } // namespace gh

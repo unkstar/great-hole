@@ -58,6 +58,7 @@ constexpr const char name_endpoint[] = "Hole.endpoint";
 constexpr const char name_filter[] = "Hole.filter";
 constexpr const char name_udp[] = "Hole.udp";
 constexpr const char name_udp_mux_server[] = "Hole.udp-mux-server";
+constexpr const char name_fec_shared_state[] = "Hole.fec-shared-state";
 constexpr const char name_fec_pipeline[] = "Hole.fec-pipeline";
 constexpr const char name_udp_dyn_mux[] = "Hole.udp-dyn-mux";
 
@@ -132,6 +133,26 @@ static void pipeline_new(lua_State* L) {
     co_return 1;
   });
 }
+
+// =========================== fec_shared_state ===========================
+static void fec_shared_state_new(lua_State* L) {
+  auto& interface = *(LuaInterface*)lua_touserdata(L, lua_upvalueindex(1));
+
+  new (lua_newuserdata(L, sizeof(std::shared_ptr<FecSharedState>)))
+      std::shared_ptr<FecSharedState>(new FecSharedState());
+  luaL_getmetatable(L, name_fec_shared_state);
+  lua_setmetatable(L, -2);
+
+  // Schedule a trivial fiber to balance lua_yield in safe_yield
+  interface.Schedule([](this auto self, lua_State* L, int nres) -> Omni::Fiber::Coroutine<int> {
+    co_return 1;
+  });
+}
+
+static auto fec_shared_state_metatable = std::to_array<const struct luaL_Reg>({
+    {.name = "__gc", .func = safe_call<gc<FecSharedState, name_fec_shared_state>>},
+    {.name = NULL, .func = NULL},
+});
 
 // =========================== fec_pipeline ===========================
 static void fec_pipeline_stop(lua_State* L) {
@@ -229,8 +250,14 @@ static void fec_pipeline_new(lua_State* L) {
     is_encoder = lua_toboolean(L, 5);
   }
 
+  // Parse optional fec_shared_state at index 6
+  std::shared_ptr<FecSharedState> shared;
+  if (c >= 6 && lua_isuserdata(L, 6)) {
+    shared = *(std::shared_ptr<FecSharedState>*)luaL_checkudata(L, 6, name_fec_shared_state);
+  }
+
   auto pipe = new (lua_newuserdata(L, sizeof(std::shared_ptr<FecPipeline>)))
-      std::shared_ptr<FecPipeline>(new FecPipeline(interface.GetContext(), in, filters, out, cfg, is_encoder));
+      std::shared_ptr<FecPipeline>(new FecPipeline(interface.GetContext(), in, filters, out, cfg, is_encoder, shared));
   luaL_getmetatable(L, name_fec_pipeline);
   lua_setmetatable(L, -2);
 
@@ -560,6 +587,7 @@ static auto hole_io_object = std::to_array<const struct luaL_Reg>({
     {.name = "tun", .func = safe_yield<tun_new>},
     {.name = "udp", .func = safe_yield<udp_new>},
     {.name = "udp_mux_server", .func = safe_yield<udp_mux_server_new>},
+    {.name = "fec_shared_state", .func = safe_yield<fec_shared_state_new>},
     {.name = "fec_pipeline", .func = safe_yield<fec_pipeline_new>},
     {.name = "udp_dyn_mux", .func = safe_yield<udp_dyn_mux_new>},
     {.name = NULL, .func = NULL},
@@ -614,6 +642,12 @@ static int hole_open(lua_State* L) {
   lua_pushlightuserdata(L, &interface);
   luaL_setfuncs(L, fec_pipeline_metatable.data(), 1);
   lua_pop(L, 1);
+  lua_pop(L, 1);
+
+  luaL_newmetatable(L, name_fec_shared_state);
+  lua_pushvalue(L, -1);
+  lua_setfield(L, -2, "__index");
+  luaL_setfuncs(L, fec_shared_state_metatable.data(), 0);
   lua_pop(L, 1);
 
   luaL_newmetatable(L, name_filter);

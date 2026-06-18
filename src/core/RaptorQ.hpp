@@ -38,6 +38,10 @@ public:
     // Caller owns the returned buffer
     uint8_t* GenerateSymbol(uint32_t esi);
 
+    // Generate encoded symbol into pre-allocated buffer (T bytes).
+    // Returns true on success, false if symbol generation failed.
+    bool GenerateSymbol(uint32_t esi, uint8_t* out_buf);
+
     // Decode mode: submit a received symbol
     void SubmitSymbol(const uint8_t* symbol, size_t symbol_len, uint32_t esi);
 
