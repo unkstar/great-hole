@@ -294,6 +294,8 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
             entry.esi = shard_index;
             slot.shards.push_back(std::move(entry));
             slot.symbol_count = static_cast<uint32_t>(slot.shards.size());
+            // Track max ESI for accurate loss rate calculation
+            if (shard_index >= slot.max_esi) slot.max_esi = shard_index;
 
             // Check if we can decode
             if (slot.symbol_count >= slot.source_count) {
@@ -314,17 +316,13 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
 
                 std::vector<uint8_t> decoded(F);
                 if (rq.TryDecode(decoded.data(), F)) {
-                    // Compute loss rate for feedback
-                    // loss = (total_symbols_sent - symbols_received) / total_symbols_sent
-                    // We estimate total as source_count + ceil(source_count * current_overhead)
-                    uint32_t expected = source_count + static_cast<uint32_t>(
-                        std::ceil(source_count * (_Shared ? 0.15f : 0.15f)));
-                    if (expected < source_count) expected = source_count;
+                    // Compute loss rate from ESI gaps (accurate, no hardcoded overhead)
+                    // total_sent ≈ max_esi + 1 (symbols are sent with consecutive ESIs)
+                    uint32_t total_sent = slot.max_esi + 1;
                     float loss_rate = 0.0f;
-                    if (expected > 0) {
-                        int32_t lost = static_cast<int32_t>(expected) - static_cast<int32_t>(slot.symbol_count);
-                        if (lost > 0)
-                            loss_rate = static_cast<float>(lost) / static_cast<float>(expected);
+                    if (total_sent > slot.symbol_count) {
+                        loss_rate = static_cast<float>(total_sent - slot.symbol_count)
+                                    / static_cast<float>(total_sent);
                     }
                     if (_Shared) {
                         _Shared->latest_loss_rate = loss_rate;

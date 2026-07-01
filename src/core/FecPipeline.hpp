@@ -65,6 +65,7 @@ private:
         uint32_t group_seq = 0;
         uint32_t source_count = 0;
         uint32_t symbol_count = 0;
+        uint32_t max_esi = 0;
         std::chrono::steady_clock::time_point first_time;
 
         struct ShardEntry {
