@@ -14,9 +14,9 @@ std::unique_ptr<AdaptiveOverhead> AdaptiveOverhead::Create(uint8_t algo, float i
     case 0:
         return std::make_unique<AlgoStatic>(initial_overhead);
     case 1:
-        return std::make_unique<AlgoEwmaStatic>(initial_overhead, max_overhead, alpha, safety);
+        return std::make_unique<AlgoEwmaStatic>(initial_overhead, max_overhead, 0.1f, safety);
     case 2:
-        return std::make_unique<AlgoEwmaDynamic>(initial_overhead, max_overhead, alpha, 0.2f,
+        return std::make_unique<AlgoEwmaDynamic>(initial_overhead, max_overhead, 0.1f, 0.2f,
                                                   safety, 2.0f);
     case 3: {
         float Kp = 1.5f, Ki = 0.8f, target = 0.01f, i_max = 0.3f;

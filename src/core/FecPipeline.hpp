@@ -99,6 +99,11 @@ private:
     std::chrono::steady_clock::time_point _StartTime = std::chrono::steady_clock::now();
     uint64_t _TotalPackets = 0;
 
+    // Accumulated loss statistics for smoothed feedback (decoder only)
+    uint64_t _LossTotalSent = 0;
+    uint64_t _LossTotalRecv = 0;
+    uint32_t _LossGroupCount = 0;
+
     // Shared state between encoder and decoder (PING/FEEDBACK)
     std::shared_ptr<FecSharedState> _Shared;
 };
