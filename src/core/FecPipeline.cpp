@@ -324,16 +324,24 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
 
                 std::vector<uint8_t> decoded(F);
                 if (rq.TryDecode(decoded.data(), F)) {
-                    // Compute loss rate from ESI gaps (accurate, no hardcoded overhead)
-                    // total_sent ≈ max_esi + 1 (symbols are sent with consecutive ESIs)
+                    // Accumulate loss stats over multiple groups for stable estimate
+                    // Per-group: total_sent ≈ max_esi + 1 (symbols sent consecutively)
                     uint32_t total_sent = slot.max_esi + 1;
-                    float loss_rate = 0.0f;
-                    if (total_sent > slot.symbol_count) {
-                        loss_rate = static_cast<float>(total_sent - slot.symbol_count)
-                                    / static_cast<float>(total_sent);
-                    }
-                    if (_Shared) {
+                    _LossTotalSent += total_sent;
+                    _LossTotalRecv += slot.symbol_count;
+                    _LossGroupCount++;
+
+                    // Update shared loss rate every N groups (smoothed)
+                    if (_LossGroupCount >= 8 && _Shared && _LossTotalSent > 0) {
+                        float loss_rate = 0.0f;
+                        if (_LossTotalSent > _LossTotalRecv) {
+                            loss_rate = static_cast<float>(_LossTotalSent - _LossTotalRecv)
+                                        / static_cast<float>(_LossTotalSent);
+                        }
                         _Shared->latest_loss_rate = loss_rate;
+                        _LossTotalSent = 0;
+                        _LossTotalRecv = 0;
+                        _LossGroupCount = 0;
                     }
 
                     BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this
