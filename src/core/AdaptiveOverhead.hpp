@@ -37,8 +37,8 @@ public:
     // Factory: create by algo index
     static std::unique_ptr<AdaptiveOverhead> Create(uint8_t algo, float initial_overhead,
                                                      float max_overhead,
-                                                     float alpha = 0.3f,
-                                                     float safety = 0.05f);
+                                                     float safety = 0.01f,
+                                                     float alpha = 0.1f);
 };
 
 // ==================== Algorithm 0: Static ====================
