@@ -33,7 +33,8 @@ FecPipeline::FecPipeline(boost::asio::io_context& io, std::shared_ptr<EndpointIn
                          std::shared_ptr<FecSharedState> shared)
     : Pipeline(io, in, filters, out), _Cfg(cfg), _IsEncoder(is_encoder), _Shared(std::move(shared)) {
     if (is_encoder) {
-        _OverheadCtrl = AdaptiveOverhead::Create(cfg.algo, cfg.overhead, cfg.max_overhead);
+        _OverheadCtrl = AdaptiveOverhead::Create(cfg.algo, cfg.overhead, cfg.max_overhead,
+                                                   cfg.safety_margin);
         BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this << ") adaptive overhead: "
                                << _OverheadCtrl->Name() << " algo=" << (int)cfg.algo;
     } else {
@@ -406,7 +407,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
     float adaptive_ratio = _Cfg.repeat_ratio;
     if (_OverheadCtrl) {
         float oh = _OverheadCtrl->GetOverhead();
-        float frac = (oh - 0.05f) / (_Cfg.max_overhead - 0.05f);
+        float frac = (oh - _Cfg.safety_margin) / (_Cfg.max_overhead - _Cfg.safety_margin);
         frac = std::clamp(frac, 0.0f, 1.0f);
         adaptive_ratio = _Cfg.repeat_ratio_min +
             (_Cfg.repeat_ratio_max - _Cfg.repeat_ratio_min) * frac;
