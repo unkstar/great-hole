@@ -322,16 +322,389 @@ PING 包携带发送时间戳 (payload 字段)。接收方收到后，将 `send_
 
 - 收方每 decode 一个 group → `feedback = uint8_t(loss_rate × 250)` (clamp 250)
 - 写入包中 feedback 字段
-- 发方收到后：`ewma = α × new_loss + (1-α) × ewma` (α=0.3)
-- 实际 overhead = `min(ewma/(1-ewma) + safety_margin, max_overhead)`
+- 发方收到后交给 `AdaptiveOverhead` 控制器处理
+- `FecConfig` 新增 `algo` 字段选择算法
 
-### 自适应 overhead
+### 自适应 overhead 算法
 
-| 丢包率 p | overhead = p/(1-p) | +5% 安全 |
-|:---:|:---:|:---:|
-| 10% | 11.1% | 16.1% |
-| 15% | 17.6% | 22.6% |
-| 20% | 25.0% | 30.0% |
+RaptorQ 理论最小开销：给定丢包率 p，需 overhead ≥ p/(1-p) 才能恢复。
+实际需加安全余量以覆盖：有限 block 的方差、丢包突发、RTT 反馈延迟。
+
+以下列出全部候选算法，待实现后通过可控丢包测试（`test_drop_rate` 选项）对比选择。
+
+---
+
+#### 算法 0: Static（静态固定值）★ 当前实现
+
+**原理**：不自适应，始终使用初始 `overhead` 值。
+
+```
+overhead = cfg.overhead  // 固定
+```
+
+**优点**：最简单，零计算开销。
+**缺点**：无法响应链路变化，要么浪费带宽要么保护不足。
+**用途**：作为 baseline 对照。
+
+---
+
+#### 算法 1: EWMA + Static Safety（带静态安全余量的指数平滑）★ 当前实现
+
+**原理**：EWMA 平滑丢包率，加固定安全余量。
+
+```
+L_ewma[t] = α * L_sample + (1-α) * L_ewma[t-1]
+overhead  = L_ewma / (1 - L_ewma) + safety_margin
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `alpha` | 0.3 | EWMA 平滑因子，越大反应越快但越抖 |
+| `safety_margin` | 0.05 | 固定安全余量 5% |
+
+**理论依据**：`p/(1-p)` 是无限 block size 下 Shannon 下界（3GPP TR 26.822）。
+有限 K 需要额外余量（K=20 需 45%，K=100 需 24%，vs 理论 11.1%）。
+
+**优点**：实现简单，平滑稳定。
+**缺点**：反应滞后于丢包突变，安全余量不随 block 大小变化。
+
+---
+
+#### 算法 2: EWMA + Dynamic Safety（带动态安全余量的指数平滑）
+
+**原理**：安全余量随丢包率波动自动缩放。
+
+```
+L_ewma[t]  = α * L_sample + (1-α) * L_ewma[t-1]
+σ²[t]      = β * (L_sample - L_ewma)² + (1-β) * σ²[t-1]
+safety     = safety_base + γ * sqrt(σ²)
+overhead   = L_ewma / (1 - L_ewma) + safety
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `alpha` | 0.3 | EWMA 平滑因子 |
+| `beta` | 0.2 | 方差平滑因子 |
+| `safety_base` | 0.03 | 基础安全余量 |
+| `gamma` | 2.0 | 波动放大系数 |
+
+**理论依据**：当丢包率稳定时方差小 → 安全余量接近 safety_base，节省带宽。
+当丢包率剧烈波动时方差大 → 安全余量自动扩大，应对突变。
+
+**优点**：自动适应链路稳定性，优于固定余量。
+**缺点**：增加一个平滑参数，调参略复杂。
+
+---
+
+#### 算法 3: PI Controller（比例-积分控制）
+
+**原理**：经典控制论，以目标丢包率为 setpoint。
+
+```
+error     = L_target - L_measured     // 目标丢包 0，实际丢包 >0 则 error <0
+integral  = clamp(integral + error * dt, -0.3, 0.3)  // 防积分饱和
+overhead  = Kp * (-error) + Ki * integral
+overhead  = clamp(overhead, 0.01, max_overhead)
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `Kp` | 1.5 | 比例增益 |
+| `Ki` | 0.8 | 积分增益 |
+| `L_target` | 0.01 | 目标丢包率（不为 0 避免永久补偿）|
+
+**理论依据**：PID-FEC 机制（IJES 2019），Ziegler-Nichols 整定 Kp=1.52, Ki=1.43。
+PI（去掉微分项）在测量噪声大时更鲁棒（INFOCOM 2017 PIA 控制器）。
+
+**优点**：控制理论完备，稳态误差可消除，业界验证。
+**缺点**：参数需整定，积分饱和需处理。
+
+---
+
+#### 算法 4: MIMD（乘性增加/乘性减少）
+
+**原理**：解码失败→快速乘性增加，解码成功→缓慢乘性减少。
+
+```
+if decode_failed:
+    overhead *= (1 + λ_up)      // 快速拉起
+elif consecutive_success > N_stable:
+    overhead *= (1 - λ_down)    // 缓慢回落
+overhead = clamp(overhead, min_overhead, max_overhead)
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `lambda_up` | 0.50 | 失败时增加 50% |
+| `lambda_down` | 0.05 | 成功时减少 5% |
+| `N_stable` | 20 | 连续成功多少个 group 后才开始降 |
+
+**理论依据**：类似 TCP 的 AIMD 但用乘法提速。RaptorQ 的 rateless 特性使得 overhead=0 也有 99.6% 成功率（p≤1% 时），因此 MIMD 可安全收敛到极小值。
+
+**优点**：反应极快（丢包尖峰立刻拉高），稳态 overhead 自动收敛到最低值。
+**缺点**：可能 overshoot（峰值 overhead 偏高），需 min_overhead 防止过低。
+
+---
+
+#### 算法 5: Quantile Target（分位数目标）
+
+**原理**：用 P95/P99 丢包率代替均值，覆盖尖峰。
+
+```
+loss_window = queue<最近 N 个 group 的丢包率>
+L_target    = percentile(loss_window, pct)  // 如 P95
+overhead    = L_target / (1 - L_target) + safety_margin
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `window_size` | 64 | 滑动窗口 group 数 |
+| `percentile` | 95 | 目标分位数 (90/95/99) |
+| `safety_margin` | 0.03 | 在小分位数之上再加余量 |
+
+**理论依据**：均值对丢包尖峰不敏感；P95 可覆盖 95% 的场景，避免为偶发尖峰过度补偿。
+配合 RaptorQ rateless 特性，单次尖峰超出 overhead 时仅丢一个 group，影响可控。
+
+**优点**：天然抗尖峰，不因偶发大丢包而过度反应。
+**缺点**：窗口大小和分位数的选择需要经验调优。
+
+---
+
+#### 算法 6: Burst-Aware EWMA（突发感知指数平滑）
+
+**原理**：区分背景丢包和突发丢包，分开统计。
+
+```
+if L_sample > L_ewma + burst_threshold:
+    // 检测到突发
+    L_burst[t] = α_fast * L_sample + (1-α_fast) * L_burst[t-1]
+else:
+    L_burst[t] = α_slow * L_burst[t-1]  // 缓慢衰减
+L_bg[t]     = α_slow * L_sample + (1-α_slow) * L_bg[t-1]
+overhead    = max(L_bg / (1-L_bg), L_burst / (1-L_burst)) + safety
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `alpha_slow` | 0.1 | 背景丢包平滑（慢） |
+| `alpha_fast` | 0.6 | 突发丢包平滑（快） |
+| `burst_threshold` | 0.05 | 超过 EWMA 多少判定为突发 |
+
+**理论依据**：Gilbert 信道模型 — 丢包不是独立同分布，有"好状态"和"坏状态"。
+分状态跟踪可避免突发结束后 overhead 回落过慢。
+
+**优点**：对真实链路（含突发丢包）效果最好。
+**缺点**：两个状态 + 阈值判断，实现稍复杂。
+
+---
+
+#### 算法 7: Gradient Throughput Optimization（梯度下降吞吐优化）
+
+**原理**：直接优化目标函数 `throughput = (1-overhead) * (1-loss_rate)`。
+
+```
+// 观测: 上次 overhead 产生的实际 throughput
+T_prev = (1 - overhead_prev) * (1 - L_measured)
+// 微调 overhead，观测 throughput 变化
+overhead_try = overhead_prev + δ
+// 下一次测得的 throughput
+T_try  = (1 - overhead_try) * (1 - L_new)
+// 梯度方向
+if T_try > T_prev:
+    overhead = overhead_try          // 同方向继续
+else:
+    overhead = overhead_prev - δ    // 反向
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `delta` | 0.02 | 微调步长 |
+| `eval_interval` | 500ms | 评估间隔 |
+
+**理论依据**：TAROT（ACM MMSys 2026）— 优化驱动的 FEC 参数选择。
+直接最大化有效吞吐而非最小化丢包率，避免"为消除最后 1% 丢包浪费 30% 带宽"的问题。
+
+**优点**：理论上最优，不需要预设公式参数。
+**缺点**：收敛慢，需在线探索（exploration cost）。
+
+---
+
+### 算法对照表
+
+| 算法 | 反应速度 | 稳定性 | 实现复杂度 | 适用场景 |
+|------|:---:|:---:|:---:|------|
+| 0 Static | N/A | ★★★★★ | 最简单 | baseline 对照 |
+| 1 EWMA+Static | ★★ | ★★★★ | 简单 | 当前实现，稳定链路 |
+| 2 EWMA+Dynamic | ★★ | ★★★★ | 中等 | 丢包波动大的链路 |
+| 3 PI | ★★★ | ★★★★ | 中等 | 需要稳态无差 |
+| 4 MIMD | ★★★★★ | ★★★ | 简单 | 需要快速响应突变 |
+| 5 Quantile | ★★ | ★★★★★ | 中等 | 偶发尖峰、稳定链路 |
+| 6 Burst-Aware | ★★★★ | ★★★★ | 较复杂 | 真实链路含突发 |
+| 7 Gradient | ★ | ★★★ | 复杂 | 理论最优、代价可接受 |
+
+### 测试方案：可控丢包率
+
+`FecConfig` 新增字段：
+
+```cpp
+struct FecConfig {
+    // ... 现有字段 ...
+    uint8_t algo = 1;            // 自适应算法 0~7
+    float test_drop_rate = 0;    // 主动随机丢包率 0.0~1.0 (0=禁用)
+    uint32_t test_drop_burst = 1; // 丢包突发长度 (1=随机独立丢包)
+};
+```
+
+### 主动丢包模型（测试用）
+
+主动丢包在 `FecPipeline::Process()` decode 路径入口实现：收到包后先经过 `LossPattern::ShouldDrop()`，
+若返回 true 则丢弃（模拟丢包），否则送入 decoder。
+
+`FecConfig` 字段：
+
+```cpp
+uint8_t  test_drop_pattern = 0;  // 丢包模型 0~6 (0=禁用)
+float    test_drop_rate  = 0.0f; // 基础丢包率
+float    test_drop_rate2 = 0.0f; // 辅助参数 (各模型含义不同)
+uint32_t test_drop_burst = 1;    // 突发长度 / 周期
+```
+
+#### 模型 0: Disabled — 关闭主动丢包
+
+#### 模型 1: Bernoulli（独立随机丢包）
+
+每个包以概率 `p = test_drop_rate` 独立丢弃。**无记忆性**，相邻包丢包不相关。
+
+```
+ShouldDrop(): return rand() < p
+```
+
+最基础的 baseline。真实链路（尤其是无线链路）的丢包通常是突发的，
+Bernoulli 模型无法体现这一点。
+
+#### 模型 2: Gilbert（2 状态 Markov 突发丢包）
+
+两个状态：Good（0% 丢包）和 Bad（100% 丢包）。
+
+```
+       p (Good→Bad)
+    ┌──────────────►
+  Good (0% loss)   Bad (100% loss)
+    ◄──────────────
+       r (Bad→Good)
+
+平均突发长度 = 1/r
+平均良好长度 = 1/p
+稳态丢包率   = p / (p + r)
+```
+
+**参数映射**：
+- `test_drop_rate` = 稳态丢包率目标
+- `test_drop_burst` = 目标平均突发长度（packets）
+- `r = 1.0 / test_drop_burst`
+- `p = r * test_drop_rate / (1 - test_drop_rate)`
+
+**适用范围**：无线衰落信道的一阶近似。丢包成簇出现，比 Bernoulli 更真实。
+
+#### 模型 3: Gilbert-Elliott（2 状态 Markov 带背景丢包）
+
+Gilbert 的扩展：Good 状态也有非零丢包率 k，Bad 状态丢包率 h<1。
+
+```
+       p (Good→Bad)
+    ┌──────────────────────►
+  Good (k% loss)        Bad (h% loss)
+    ◄──────────────────────
+       r (Bad→Good)
+```
+
+**参数映射**：
+- `test_drop_rate` = 稳态丢包率目标
+- `test_drop_rate2` = Good 状态丢包率 k（背景噪声，default 0.01）
+- `test_drop_burst` = 目标平均突发长度
+- `h = min(k + (test_drop_rate - k) / π_bad, 0.95)`
+- `r = 1.0 / test_drop_burst`
+- `p = r * π_bad / (1 - π_bad)`
+
+**适用范围**：Wi-Fi、LTE/4G 等真实无线链路的 empirical 验证最佳模型。
+标准文档广泛引用（str0m-netem, IEEE 802.11 仿真）。
+
+#### 模型 4: Sinusoidal（正弦波动丢包）
+
+丢包率随时间呈正弦变化，模拟周期性拥塞（如每天高峰时段、TCP 全局同步）。
+
+```
+loss_rate(t) = baseline + amplitude * sin(2π * t / period)
+```
+
+**参数映射**：
+- `test_drop_rate` = 峰值丢包率（baseline + amplitude）
+- `test_drop_rate2` = 谷值丢包率（baseline，默认 0.01）
+- `test_drop_burst` = 周期（秒），默认 60
+
+```
+baseline  = test_drop_rate2
+amplitude = test_drop_rate - test_drop_rate2
+```
+
+每个包仍按瞬时 loss_rate 做 Bernoulli 丢弃。
+
+**适用范围**：测试算法对缓慢周期性变化的跟踪能力。
+
+#### 模型 5: Step（阶跃突变丢包）
+
+丢包率在指定时间点从低值突跳到高值（或反过来），模拟链路故障/恢复。
+
+```
+loss_rate(t) = rate_before  (t < step_time)
+loss_rate(t) = rate_after   (t >= step_time)
+```
+
+**参数映射**：
+- `test_drop_rate` = 突变后丢包率
+- `test_drop_rate2` = 突变前丢包率（默认 0.01）
+- `test_drop_burst` = 突变发生时间（秒），默认 30
+
+**适用范围**：测试算法对突变的响应速度（反应延迟、overshoot）。
+
+#### 模型 6: Congestion Wave（拥塞波丢包）
+
+丢包率先线性爬升到峰值再线性回落，模拟真实拥塞事件（buffer 填满→排空）。
+
+```
+loss_rate(t) = min_rate + (max_rate - min_rate) * triangle(t / period)
+```
+
+其中 `triangle(x) = 2 * |2*(x mod 1) - 1|`（对称三角波）。
+
+**参数映射**：
+- `test_drop_rate` = 峰值丢包率
+- `test_drop_rate2` = 基线丢包率（默认 0.01）
+- `test_drop_burst` = 周期（秒），默认 120（2分钟爬升 + 2分钟回落 = 4分钟周期）
+
+**适用范围**：最接近真实 Internet 拥塞模式。测试算法在丢包率持续变化下的表现。
+
+### 丢包模型对照表
+
+| 模型 | 名称 | 关键特征 | 测试目标 |
+|:---:|------|------|------|
+| 0 | Disabled | 无丢包 | 验证无丢包时 overhead 收敛到最小值 |
+| 1 | Bernoulli | 独立随机 | baseline 对照 |
+| 2 | Gilbert | 2状态突发 | 突发丢包适应能力 |
+| 3 | Gilbert-Elliott | 2状态+背景噪声 | 真实无线链路模拟 |
+| 4 | Sinusoidal | 周期性正弦 | 缓慢变化的跟踪能力 |
+| 5 | Step | 阶跃突变 | 反应速度和 overshoot |
+| 6 | Congestion Wave | 三角波拥塞 | 真实拥塞场景综合评估 |
+
+### 测试流程
+
+1. 同一机器启动两个 great-hole 实例（不同端口），loopback
+2. 对每种丢包模型，设置不同丢包率档位 (1%, 5%, 10%, 20%)
+3. 分别跑 8 种自适应算法，iperf3 测 TCP/UDP 吞吐
+4. 记录每个测试的：有效吞吐、overhead 均值/峰值/稳态值、丢包恢复率、算法收敛时间
+5. 按测试场景加权评分，汇总对比表供选择
+
+### overhead 上限
 
 overhead 上限由 `max_overhead` 控制（default 0.50）。
 
@@ -365,6 +738,15 @@ struct FecConfig {
     uint32_t feedback_stale_ms = 10000;   // 无反馈回退 overhead 超时
     uint32_t ping_loss_threshold = 5;     // 连续丢 PING 阈值
     uint32_t decode_timeout_ms = 200;     // 初始解码超时 (RTT 校准后覆盖)
+
+    // === 自适应算法 ===
+    uint8_t algo = 1;                  // 算法选择 0~7
+
+    // === 可控丢包测试 ===
+    uint8_t test_drop_pattern = 0;     // 丢包模型 0~6 (0=禁用)
+    float test_drop_rate = 0.0f;       // 基础丢包率 / 峰值
+    float test_drop_rate2 = 0.0f;      // 辅助参数 (模型相关)
+    uint32_t test_drop_burst = 1;      // 突发长度 / 周期 (模型相关)
 };
 ```
 
@@ -410,6 +792,9 @@ fec_cfg = {
     feedback_stale_ms = 10000,
     ping_loss_threshold = 5,
     decode_timeout  = 200,
+    algo            = 1,            -- 自适应算法 0~7
+    test_drop_rate  = 0.0,          -- 主动丢包率 (0=禁用)
+    test_drop_burst = 1,            -- 丢包突发长度
 }
 
 -- FEC Pipeline
@@ -443,11 +828,23 @@ p_recv = hole.fec_pipeline(udp_chan, {xor_filter}, app_chan, fec_cfg)
 - IV XOR
 - 丢包率统计 + feedback 闭环
 - RTT echo 机制
-- AdaptiveOverhead
+- AdaptiveOverhead（算法 1 先实现）
 
-### Phase 5: 集成测试
-- 本地 loopback: encode → 丢包仿真 → decode
-- ali-osaka 实际链路
+### Phase 5: 可控丢包测试框架
+- `test_drop_rate` / `test_drop_burst` 实现
+- Gilbert 突发丢包模型
+- 单机 loopback 测试脚本
+
+### Phase 6: 多算法实现与对比
+- 实现算法 0~7 共 8 种
+- 同机可控丢包率测试 (0%, 1%, 5%, 10%, 20%)
+- 每算法测 TCP + UDP 吞吐，记录 overhead 均值/峰值
+- 汇总对比表，确定最终选择
+
+### Phase 7: 真实链路验证
+- ali-osaka / ali-tokyo 实际链路测试
+- 与算法 0 (static) 对比提升幅度
+- 长时稳定性测试 (24h+)
 
 ## Non-Goals
 

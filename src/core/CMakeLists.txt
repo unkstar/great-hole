@@ -10,6 +10,7 @@ foreach(suffix "" "-asan")
   endif()
 
   add_library(${target_core} STATIC
+    AdaptiveOverhead.cpp
     BackoffTimer.cpp
     Pipeline.cpp
     Endpoint.cpp
@@ -20,6 +21,7 @@ foreach(suffix "" "-asan")
     EndpointUdpMux.cpp
     EndpointUdpDynMux.cpp
     FecPipeline.cpp
+    LossPattern.cpp
     RaptorQ.cpp
   )
 

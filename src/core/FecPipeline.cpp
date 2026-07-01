@@ -9,27 +9,43 @@
 
 #include <boost/log/trivial.hpp>
 
+#include "AdaptiveOverhead.hpp"
 #include "Cancel.hpp"
 #include "Asio.hpp"
 #include "Coroutine.hpp"
 #include "ErrorCode.hpp"
 #include "GetCurrentFiber.hpp"
+#include "LossPattern.hpp"
 #include "Packet.hpp"
 #include "RaptorQ.hpp"
 
 namespace gh {
 
-// ==================== Constructor ====================
+// ==================== Constructor / Destructor ====================
+
+// Destructor defined here so unique_ptr<AdaptiveOverhead> and unique_ptr<LossPattern>
+// can see complete types (required for deleter).
+FecPipeline::~FecPipeline() = default;
 
 FecPipeline::FecPipeline(boost::asio::io_context& io, std::shared_ptr<EndpointInput> in,
                          const std::vector<std::shared_ptr<Filter>>& filters, std::shared_ptr<EndpointOutput> out,
                          FecConfig cfg, bool is_encoder,
                          std::shared_ptr<FecSharedState> shared)
     : Pipeline(io, in, filters, out), _Cfg(cfg), _IsEncoder(is_encoder), _Shared(std::move(shared)) {
-    if (!is_encoder) {
+    if (is_encoder) {
+        _OverheadCtrl = AdaptiveOverhead::Create(cfg.algo, cfg.overhead, cfg.max_overhead);
+        BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this << ") adaptive overhead: "
+                               << _OverheadCtrl->Name() << " algo=" << (int)cfg.algo;
+    } else {
         uint32_t window = static_cast<uint32_t>(std::bit_ceil(cfg.decode_window));
         _RingBuffer.resize(window);
         _RingMask = window - 1;
+        if (cfg.test_drop_pattern > 0) {
+            _LossPattern = LossPattern::Create(cfg.test_drop_pattern, cfg.test_drop_rate,
+                                                cfg.test_drop_rate2, cfg.test_drop_burst);
+            BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this << ") loss pattern: "
+                                   << _LossPattern->Name() << " rate=" << cfg.test_drop_rate;
+        }
     }
 }
 
@@ -108,6 +124,11 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
             }
 
             if (!batch_queue->empty() && !_Stop.IsTriggered()) {
+                // Update adaptive overhead from latest feedback
+                if (_OverheadCtrl && _Shared) {
+                    _OverheadCtrl->Update(_Shared->latest_loss_rate);
+                }
+
                 std::vector<Packet> batch; size_t n = std::min(batch_queue->size(), (size_t)_Cfg.max_batch);
                 batch.reserve(n); std::move(batch_queue->begin(), batch_queue->begin()+n, std::back_inserter(batch));
                 batch_queue->erase(batch_queue->begin(), batch_queue->begin()+n);
@@ -140,11 +161,28 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                 continue; // minimum: DWORD(4B) + fb(1B)
             }
 
+            // Active loss pattern check (test only)
+            if (_LossPattern) {
+                auto now_st = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration<double>(now_st - _StartTime).count();
+                if (_LossPattern->ShouldDrop(_TotalPackets, elapsed)) {
+                    _TotalPackets++;
+                    continue;
+                }
+            }
+            _TotalPackets++;
+
             // Parse DWORD header
             uint32_t dw = p.PopFrontLE<uint32_t>();
             uint32_t group_seq = dw & 0xFFFFFF;
             uint8_t f = (dw >> 24) & 0xFF;
             uint8_t fb = p.PopFrontLE<uint8_t>();
+
+            // Update shared state with peer's loss rate feedback
+            // fb encodes loss_rate * 250 (clamped to 250)
+            if (_Shared && fb <= 250) {
+                _Shared->latest_loss_rate = static_cast<float>(fb) / 250.0f;
+            }
 
             uint64_t echo = 0;
             bool has_echo = (f & kEcho) != 0;
@@ -276,9 +314,26 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
 
                 std::vector<uint8_t> decoded(F);
                 if (rq.TryDecode(decoded.data(), F)) {
+                    // Compute loss rate for feedback
+                    // loss = (total_symbols_sent - symbols_received) / total_symbols_sent
+                    // We estimate total as source_count + ceil(source_count * current_overhead)
+                    uint32_t expected = source_count + static_cast<uint32_t>(
+                        std::ceil(source_count * (_Shared ? 0.15f : 0.15f)));
+                    if (expected < source_count) expected = source_count;
+                    float loss_rate = 0.0f;
+                    if (expected > 0) {
+                        int32_t lost = static_cast<int32_t>(expected) - static_cast<int32_t>(slot.symbol_count);
+                        if (lost > 0)
+                            loss_rate = static_cast<float>(lost) / static_cast<float>(expected);
+                    }
+                    if (_Shared) {
+                        _Shared->latest_loss_rate = loss_rate;
+                    }
+
                     BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this
                                             << ") decoded group " << group_seq
-                                            << " with " << slot.symbol_count << " symbols";
+                                            << " with " << slot.symbol_count << " symbols"
+                                            << " loss=" << loss_rate;
 
                     // Split blob into individual packets
                     size_t pos = 0;
@@ -366,8 +421,10 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
                 out.PushFront(std::span<const uint8_t>(iv));
             }
 
-            // fb byte
-            out.PushFrontLE(static_cast<uint8_t>(0));
+            // fb byte = loss_rate * 250 (clamped to 250)
+            float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
+            uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
+            out.PushFrontLE(fb);
 
             // DWORD header with REPEAT flag
             uint32_t repeat_dw = (group_seq & 0xFFFFFF) | static_cast<uint32_t>(flags | kRepeat) << 24;
@@ -407,7 +464,9 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
         rq.Encode(blob.data(), blob.size());
         uint32_t K = rq.K();
 
-        uint32_t extra = static_cast<uint32_t>(std::ceil(K * _Cfg.overhead));
+        // Use adaptive overhead controller
+        float current_overhead = _OverheadCtrl ? _OverheadCtrl->GetOverhead() : _Cfg.overhead;
+        uint32_t extra = static_cast<uint32_t>(std::ceil(K * current_overhead));
         uint32_t total_symbols = K + extra;
         if (total_symbols > 65535) {
             total_symbols = 65535;
@@ -460,7 +519,10 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
                 out.PushFrontLE(static_cast<uint8_t>(esi));
             }
 
-            out.PushFrontLE(static_cast<uint8_t>(0)); // fb = 0
+            // fb = loss_rate * 250
+            float fb_loss2 = _Shared ? _Shared->latest_loss_rate : 0.0f;
+            uint8_t fb2 = static_cast<uint8_t>(std::min(fb_loss2 * 250.0f, 250.0f));
+            out.PushFrontLE(fb2);
             out.PushFrontLE(final_dw);
 
             out_batch.push_back(std::move(out));
@@ -509,8 +571,12 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendPing(uint64_t timestamp_us) {
     uint8_t flags = BuildFlags() | kPing;
     uint32_t dw = BuildDword(++_GroupSeq, flags);
 
+    // fb byte with latest loss rate
+    float fb_loss_ping = _Shared ? _Shared->latest_loss_rate : 0.0f;
+    uint8_t fb_ping = static_cast<uint8_t>(std::min(fb_loss_ping * 250.0f, 250.0f));
+
     out.PushFrontLE(timestamp_us);                  // ping payload
-    out.PushFrontLE(static_cast<uint8_t>(0));       // fb = 0
+    out.PushFrontLE(fb_ping);                       // fb = latest_loss_rate * 250
     out.PushFrontLE(dw);                            // DWORD header
 
     auto err = co_await _Out->Write(out, _Stop);
@@ -530,8 +596,12 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendFeedback(uint64_t echo_us) {
     uint8_t flags = BuildFlags() | kFeedback | kEcho;
     uint32_t dw = BuildDword(++_GroupSeq, flags);
 
+    // fb byte with latest loss rate
+    float fb_loss_fb = _Shared ? _Shared->latest_loss_rate : 0.0f;
+    uint8_t fb_fb = static_cast<uint8_t>(std::min(fb_loss_fb * 250.0f, 250.0f));
+
     out.PushFrontLE(echo_us);                       // echo timestamp
-    out.PushFrontLE(static_cast<uint8_t>(0));       // fb = 0
+    out.PushFrontLE(fb_fb);                         // fb = latest_loss_rate * 250
     out.PushFrontLE(dw);                            // DWORD header
 
     auto err = co_await _Out->Write(out, _Stop);

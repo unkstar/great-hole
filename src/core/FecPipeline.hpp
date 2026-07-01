@@ -10,6 +10,9 @@
 
 namespace gh {
 
+class AdaptiveOverhead;
+class LossPattern;
+
 // Shared state between encoder and decoder on the same side.
 // Used for PING/FEEDBACK loop and RTT measurement.
 struct FecSharedState {
@@ -21,6 +24,8 @@ struct FecSharedState {
     uint64_t last_ping_sent_us = 0;
     // Consecutive PINGs lost (encoder increments on timeout)
     uint32_t consecutive_ping_lost = 0;
+    // Latest measured loss rate from decoder [0..1] (encoder reads for feedback byte)
+    float latest_loss_rate = 0.0f;
 };
 
 class FecPipeline : public Pipeline {
@@ -29,7 +34,7 @@ public:
                 const std::vector<std::shared_ptr<Filter>>& filters,
                 std::shared_ptr<EndpointOutput> out, FecConfig cfg, bool is_encoder,
                 std::shared_ptr<FecSharedState> shared = nullptr);
-    ~FecPipeline() override = default;
+    ~FecPipeline() override;
 
 protected:
     Omni::Fiber::Coroutine<void> Process() override;
@@ -79,9 +84,19 @@ private:
     FecConfig _Cfg;
     bool _IsEncoder;
 
+    // Adaptive overhead controller (encode side)
+    std::unique_ptr<AdaptiveOverhead> _OverheadCtrl;
+
+    // Active loss pattern for testing (decode side)
+    std::unique_ptr<LossPattern> _LossPattern;
+
     // Encode state
     uint32_t _GroupSeq = 0;
     std::chrono::steady_clock::time_point _LastPingTime;
+
+    // Decode state
+    std::chrono::steady_clock::time_point _StartTime = std::chrono::steady_clock::now();
+    uint64_t _TotalPackets = 0;
 
     // Shared state between encoder and decoder (PING/FEEDBACK)
     std::shared_ptr<FecSharedState> _Shared;
