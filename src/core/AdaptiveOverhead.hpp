@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <queue>
 #include <random>
 #include <stdexcept>
