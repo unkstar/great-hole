@@ -170,8 +170,14 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                 continue; // minimum: DWORD(4B) + fb(1B)
             }
 
-            // Active loss pattern check (test only)
-            if (_LossPattern) {
+            // Parse DWORD header first (needed for control packet detection)
+            uint32_t dw = p.PopFrontLE<uint32_t>();
+            uint32_t group_seq = dw & 0xFFFFFF;
+            uint8_t f = (dw >> 24) & 0xFF;
+
+            // Active loss pattern check (test only) — skip control packets
+            bool is_control = (f & kPing) || (f & kFeedback);
+            if (!is_control && _LossPattern) {
                 auto now_st = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration<double>(now_st - _StartTime).count();
                 if (_LossPattern->ShouldDrop(_TotalPackets, elapsed)) {
@@ -181,10 +187,6 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
             }
             _TotalPackets++;
 
-            // Parse DWORD header
-            uint32_t dw = p.PopFrontLE<uint32_t>();
-            uint32_t group_seq = dw & 0xFFFFFF;
-            uint8_t f = (dw >> 24) & 0xFF;
             uint8_t fb = p.PopFrontLE<uint8_t>();
 
             // Update shared state with peer's loss rate feedback
