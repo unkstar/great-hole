@@ -327,13 +327,14 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
 
                 std::vector<uint8_t> decoded(F);
                 if (rq.TryDecode(decoded.data(), F)) {
-                    // Update shared loss rate every N groups (binary success/failure)
-                    if (_LossGroupCount >= 8 && _Shared) {
+                    // Update shared loss rate every N groups (configurable window)
+                    uint32_t window = _Cfg.loss_window_groups > 0 ? _Cfg.loss_window_groups : 50;
+                    if (_LossGroupCount >= window && _Shared) {
                         float fail_rate = static_cast<float>(_LossFailCount)
                                           / static_cast<float>(_LossGroupCount);
-                        // IIR low-pass for stability
+                        float alpha = _Cfg.loss_alpha > 0 ? _Cfg.loss_alpha : 0.1f;
                         _Shared->latest_loss_rate =
-                            0.1f * fail_rate + 0.9f * _Shared->latest_loss_rate;
+                            alpha * fail_rate + (1.0f - alpha) * _Shared->latest_loss_rate;
                         _LossGroupCount = 0;
                         _LossFailCount = 0;
                     }

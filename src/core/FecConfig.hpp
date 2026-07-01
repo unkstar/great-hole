@@ -23,6 +23,8 @@ struct FecConfig {
 
     // Adaptive overhead algorithm selection
     uint8_t algo = 1;                  // algorithm 0~7 (see fec-spec.md)
+    uint32_t loss_window_groups = 50;  // groups per loss-rate update (~500ms-1s)
+    float loss_alpha = 0.1f;           // IIR smoothing factor for loss rate
 
     // Controllable packet loss for testing
     uint8_t test_drop_pattern = 0;     // loss model 0~6 (0=disabled)

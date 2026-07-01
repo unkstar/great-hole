@@ -247,6 +247,12 @@ static void fec_pipeline_new(lua_State* L) {
     lua_getfield(L, 4, "algo");
     if (lua_isinteger(L, -1)) cfg.algo = (uint8_t)lua_tointeger(L, -1);
     lua_pop(L, 1);
+    lua_getfield(L, 4, "loss_window_groups");
+    if (lua_isinteger(L, -1)) cfg.loss_window_groups = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "loss_alpha");
+    if (lua_isnumber(L, -1)) cfg.loss_alpha = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
 
     // === Controllable packet loss ===
     lua_getfield(L, 4, "test_drop_pattern");
