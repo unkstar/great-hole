@@ -8,7 +8,9 @@ struct FecConfig {
     uint32_t timeout_ms = 4;           // batch maximum wait time (min 1)
     float overhead = 0.15f;            // initial redundancy ratio
     float max_overhead = 0.50f;        // adaptive overhead upper limit
-    float repeat_ratio = 4.0f;         // single-packet REPEAT multiplier = 1+ceil(ratio)
+    float repeat_ratio = 4.0f;         // initial single-pkt REPEAT: copies=1+ceil(ratio)
+    float repeat_ratio_min = 1.0f;     // min REPEAT ratio (lowest copies=2)
+    float repeat_ratio_max = 5.0f;     // max REPEAT ratio (highest copies=6)
     uint32_t symbol_size = 0;          // RaptorQ symbol size, 0 = auto-calculate from MTU
     uint32_t mtu = 1500;               // used for symbol_size calculation
     uint32_t max_batch = 200;          // symbol_count upper limit

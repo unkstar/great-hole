@@ -209,6 +209,12 @@ static void fec_pipeline_new(lua_State* L) {
     lua_getfield(L, 4, "repeat_ratio");
     if (lua_isnumber(L, -1)) cfg.repeat_ratio = (float)lua_tonumber(L, -1);
     lua_pop(L, 1);
+    lua_getfield(L, 4, "repeat_ratio_min");
+    if (lua_isnumber(L, -1)) cfg.repeat_ratio_min = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "repeat_ratio_max");
+    if (lua_isnumber(L, -1)) cfg.repeat_ratio_max = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
     lua_getfield(L, 4, "symbol_size");
     if (lua_isinteger(L, -1)) cfg.symbol_size = (uint32_t)lua_tointeger(L, -1);
     lua_pop(L, 1);
