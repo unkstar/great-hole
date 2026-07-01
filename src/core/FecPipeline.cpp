@@ -126,7 +126,15 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
             if (!batch_queue->empty() && !_Stop.IsTriggered()) {
                 // Update adaptive overhead from latest feedback
                 if (_OverheadCtrl && _Shared) {
+                    float before = _OverheadCtrl->GetOverhead();
                     _OverheadCtrl->Update(_Shared->latest_loss_rate);
+                    float after = _OverheadCtrl->GetOverhead();
+                    static int log_counter = 0;
+                    if (++log_counter % 50 == 1) {
+                        BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this
+                            << ") overhead: " << before << " -> " << after
+                            << " loss=" << _Shared->latest_loss_rate;
+                    }
                 }
 
                 std::vector<Packet> batch; size_t n = std::min(batch_queue->size(), (size_t)_Cfg.max_batch);
