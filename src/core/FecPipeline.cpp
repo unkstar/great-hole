@@ -322,26 +322,20 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                     rq.SubmitSymbol(shard.data.data(), symbol_size, shard.esi);
                 }
 
+                // Accumulate decode success/failure for stable loss estimation
+                _LossGroupCount++;
+
                 std::vector<uint8_t> decoded(F);
                 if (rq.TryDecode(decoded.data(), F)) {
-                    // Accumulate loss stats over multiple groups for stable estimate
-                    // Per-group: total_sent ≈ max_esi + 1 (symbols sent consecutively)
-                    uint32_t total_sent = slot.max_esi + 1;
-                    _LossTotalSent += total_sent;
-                    _LossTotalRecv += slot.symbol_count;
-                    _LossGroupCount++;
-
-                    // Update shared loss rate every N groups (smoothed)
-                    if (_LossGroupCount >= 8 && _Shared && _LossTotalSent > 0) {
-                        float loss_rate = 0.0f;
-                        if (_LossTotalSent > _LossTotalRecv) {
-                            loss_rate = static_cast<float>(_LossTotalSent - _LossTotalRecv)
-                                        / static_cast<float>(_LossTotalSent);
-                        }
-                        _Shared->latest_loss_rate = loss_rate;
-                        _LossTotalSent = 0;
-                        _LossTotalRecv = 0;
+                    // Update shared loss rate every N groups (binary success/failure)
+                    if (_LossGroupCount >= 8 && _Shared) {
+                        float fail_rate = static_cast<float>(_LossFailCount)
+                                          / static_cast<float>(_LossGroupCount);
+                        // IIR low-pass for stability
+                        _Shared->latest_loss_rate =
+                            0.1f * fail_rate + 0.9f * _Shared->latest_loss_rate;
                         _LossGroupCount = 0;
+                        _LossFailCount = 0;
                     }
 
                     BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this
@@ -384,6 +378,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                         }
                     }
                 } else {
+                    _LossFailCount++;  // decode failure = loss event
                     BOOST_LOG_TRIVIAL(warning) << "FecPipeline(" << this
                                                << ") decode failed for group " << group_seq
                                                << " with " << slot.symbol_count << " symbols";

@@ -5,7 +5,7 @@ import subprocess, time, json
 PW = "REDACTED"
 ALI = "ali"
 RES = "/tmp/fec-matrix-final.csv"
-DUR = 10
+DUR = 15
 
 NAMES = ["Static","EWMA+Static","EWMA+Dynamic","PI","MIMD","Quantile","BurstAware","Gradient"]
 
@@ -91,7 +91,7 @@ for algo in range(8):
     # iperf3
     sali(f"iperf3 -s -1 -B 172.31.32.1 >/dev/null 2>&1 &")
     time.sleep(0.5)
-    r = subprocess.run(["iperf3", "-c", "172.31.32.1", "-t", str(DUR), "-P", "2", "-J"],
+    r = subprocess.run(["iperf3", "-c", "172.31.32.1", "-t", str(DUR), "-P", "4", "-J"],
                        capture_output=True, text=True, timeout=DUR+10)
     try:
         d = json.loads(r.stdout)
