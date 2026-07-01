@@ -402,9 +402,19 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
     uint32_t flags = BuildFlags();
     uint32_t dw = BuildDword(group_seq, static_cast<uint8_t>(flags));
 
-    if (pkt_count == 1 && _Cfg.repeat_ratio > 0.0f) {
+    // Adaptive REPEAT: ratio scales with current overhead
+    float adaptive_ratio = _Cfg.repeat_ratio;
+    if (_OverheadCtrl) {
+        float oh = _OverheadCtrl->GetOverhead();
+        float frac = (oh - 0.05f) / (_Cfg.max_overhead - 0.05f);
+        frac = std::clamp(frac, 0.0f, 1.0f);
+        adaptive_ratio = _Cfg.repeat_ratio_min +
+            (_Cfg.repeat_ratio_max - _Cfg.repeat_ratio_min) * frac;
+    }
+
+    if (pkt_count == 1 && adaptive_ratio > 0.0f) {
         // REPEAT mode: send multiple copies with repeat flag
-        uint32_t copies = static_cast<uint32_t>(std::ceil(_Cfg.repeat_ratio)) + 1;
+        uint32_t copies = static_cast<uint32_t>(std::ceil(adaptive_ratio)) + 1;
         auto& pkt = batch[0];
 
         // Generate IV for obfuscation if enabled
