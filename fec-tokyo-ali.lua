@@ -1,6 +1,5 @@
 -- Ali side: FEC hole to tokyo
 -- Run via: /usr/local/bin/gh-fec2 --startlua /tmp/fec-tokyo-ali.lua
--- Uses separate tun interface and ports from production
 
 local tokyo_ip = '202.144.195.145'
 local ali_port = 11555
