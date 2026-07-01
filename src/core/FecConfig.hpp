@@ -20,6 +20,15 @@ struct FecConfig {
     uint32_t feedback_stale_ms = 10000;   // no-feedback fallback overhead timeout
     uint32_t ping_loss_threshold = 5;     // consecutive PING loss threshold
     uint32_t decode_timeout_ms = 200;     // initial decode timeout (RTT-calibrated override)
+
+    // Adaptive overhead algorithm selection
+    uint8_t algo = 1;                  // algorithm 0~7 (see fec-spec.md)
+
+    // Controllable packet loss for testing
+    uint8_t test_drop_pattern = 0;     // loss model 0~6 (0=disabled)
+    float test_drop_rate = 0.0f;       // primary loss rate parameter
+    float test_drop_rate2 = 0.0f;      // secondary parameter (model-dependent)
+    uint32_t test_drop_burst = 1;      // burst length / period (model-dependent)
 };
 
 } // namespace gh

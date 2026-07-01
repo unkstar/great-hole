@@ -242,6 +242,26 @@ static void fec_pipeline_new(lua_State* L) {
     lua_getfield(L, 4, "decode_timeout_ms");
     if (lua_isinteger(L, -1)) cfg.decode_timeout_ms = (uint32_t)lua_tointeger(L, -1);
     lua_pop(L, 1);
+
+    // === Adaptive algorithm ===
+    lua_getfield(L, 4, "algo");
+    if (lua_isinteger(L, -1)) cfg.algo = (uint8_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+
+    // === Controllable packet loss ===
+    lua_getfield(L, 4, "test_drop_pattern");
+    if (lua_isinteger(L, -1)) cfg.test_drop_pattern = (uint8_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "test_drop_rate");
+    if (lua_isnumber(L, -1)) cfg.test_drop_rate = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "test_drop_rate2");
+    if (lua_isnumber(L, -1)) cfg.test_drop_rate2 = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 4, "test_drop_burst");
+    if (lua_isinteger(L, -1)) cfg.test_drop_burst = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+
     lua_getfield(L, 4, "is_encoder");
     if (lua_isboolean(L, -1)) is_encoder = lua_toboolean(L, -1);
     lua_pop(L, 1);
