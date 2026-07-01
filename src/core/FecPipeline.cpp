@@ -346,8 +346,8 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
 
                     BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this
                                             << ") decoded group " << group_seq
-                                            << " with " << slot.symbol_count << " symbols"
-                                            << " loss=" << loss_rate;
+                                            << " with " << slot.symbol_count << "/"
+                                            << (slot.max_esi + 1) << " symbols";
 
                     // Split blob into individual packets
                     size_t pos = 0;
