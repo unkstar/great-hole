@@ -97,11 +97,10 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
         });
 
         while (!_Stop.IsTriggered()) {
-            if (batch_queue->empty()) {
-                auto timer = std::make_shared<boost::asio::steady_timer>(_Io);
-                timer->expires_after(std::chrono::milliseconds(_Cfg.timeout_ms));
-                co_await timer->async_wait(Omni::Fiber::AsioUseFiber);
-            }
+            // Always wait timeout_ms to accumulate a batch
+            auto timer = std::make_shared<boost::asio::steady_timer>(_Io);
+            timer->expires_after(std::chrono::milliseconds(_Cfg.timeout_ms));
+            co_await timer->async_wait(Omni::Fiber::AsioUseFiber);
 
             // Send PING periodically for RTT measurement
             if (_Shared && _Cfg.ping_interval_ms > 0) {
