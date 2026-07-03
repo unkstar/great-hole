@@ -15,3 +15,11 @@ Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: great-hole
  make great firewall great again!
+
+Package: great-hole-fec
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Conflicts: great-hole (<< 0.2.0)
+Replaces: great-hole (<< 0.2.0)
+Description: great-hole-fec — great-hole with built-in RaptorQ FEC
+ make great firewall great again! — with built-in RaptorQ FEC support.
