@@ -1,0 +1,84 @@
+#!/bin/bash
+# switch-exit — toggle ER-X and OpenVPN traffic between Osaka and Tokyo exits
+# Usage: switch-exit {osaka|tokyo|status}
+
+set -e
+
+TARGET="${1:-status}"
+OSAKA_HOLE_IP="172.31.26.25"
+TOKYO_FEC_IP="172.31.30.2"
+TABLE_OPENVPN=100
+TABLE_ERX_OSAKA=101
+TABLE_ERX_TOKYO=102
+ERX_IP="172.31.17.2"
+OVPN_NET="172.31.16.0/24"
+
+switch_to_tokyo() {
+    echo "=== Switching to Tokyo exit ==="
+
+    # ER-X traffic: remove Osaka rule, add Tokyo rule
+    ip rule del from ${ERX_IP}/32 table ${TABLE_ERX_OSAKA} 2>/dev/null || true
+    ip rule add from ${ERX_IP}/32 table ${TABLE_ERX_TOKYO} 2>/dev/null || \
+        ip rule replace from ${ERX_IP}/32 table ${TABLE_ERX_TOKYO}
+
+    # OpenVPN traffic: switch route in table 100
+    ip route replace default via ${TOKYO_FEC_IP} dev fec-tokyo table ${TABLE_OPENVPN}
+
+    echo "ER-X (${ERX_IP}) -> table ${TABLE_ERX_TOKYO} -> fec-tokyo -> Tokyo"
+    echo "OpenVPN (${OVPN_NET}) -> table ${TABLE_OPENVPN} -> fec-tokyo -> Tokyo"
+
+    # Update ER-X route download URL
+    ssh -o ConnectTimeout=5 unkstar@192.168.2.1 \
+        "sudo sed -i 's|http://${OSAKA_HOLE_IP}/routes/|http://${TOKYO_FEC_IP}/routes/|g' /config/scripts/update-routes.sh" 2>/dev/null || \
+        echo "WARNING: Could not update ER-X update-routes.sh (is ER-X reachable?)"
+}
+
+switch_to_osaka() {
+    echo "=== Switching to Osaka exit ==="
+
+    # ER-X traffic: remove Tokyo rule, add Osaka rule
+    ip rule del from ${ERX_IP}/32 table ${TABLE_ERX_TOKYO} 2>/dev/null || true
+    ip rule add from ${ERX_IP}/32 table ${TABLE_ERX_OSAKA} 2>/dev/null || \
+        ip rule replace from ${ERX_IP}/32 table ${TABLE_ERX_OSAKA}
+
+    # OpenVPN traffic: switch route in table 100
+    ip route replace default via ${OSAKA_HOLE_IP} dev hole table ${TABLE_OPENVPN}
+
+    echo "ER-X (${ERX_IP}) -> table ${TABLE_ERX_OSAKA} -> hole -> Osaka"
+    echo "OpenVPN (${OVPN_NET}) -> table ${TABLE_OPENVPN} -> hole -> Osaka"
+
+    # Update ER-X route download URL back to Osaka
+    ssh -o ConnectTimeout=5 unkstar@192.168.2.1 \
+        "sudo sed -i 's|http://${TOKYO_FEC_IP}/routes/|http://${OSAKA_HOLE_IP}/routes/|g' /config/scripts/update-routes.sh" 2>/dev/null || \
+        echo "WARNING: Could not update ER-X update-routes.sh (is ER-X reachable?)"
+}
+
+show_status() {
+    echo "=== Exit Status ==="
+    echo ""
+    echo "ER-X routing (ip rule):"
+    ip rule | grep -E "from ${ERX_IP}|from ${OVPN_NET}" || echo "  (none found)"
+    echo ""
+    echo "Table 100 (OpenVPN):"
+    ip route show table ${TABLE_OPENVPN} 2>/dev/null || echo "  (empty)"
+    echo ""
+    echo "Table 101 (ERX->Osaka):"
+    ip route show table ${TABLE_ERX_OSAKA} 2>/dev/null || echo "  (empty)"
+    echo ""
+    echo "Table 102 (ERX->Tokyo):"
+    ip route show table ${TABLE_ERX_TOKYO} 2>/dev/null || echo "  (empty)"
+    echo ""
+    echo "Tunnel status:"
+    ip link show fec-tokyo 2>/dev/null && echo "  fec-tokyo: UP" || echo "  fec-tokyo: DOWN"
+    ip link show hole 2>/dev/null && echo "  hole: UP" || echo "  hole: DOWN"
+}
+
+case "${TARGET}" in
+    tokyo)  switch_to_tokyo ;;
+    osaka)  switch_to_osaka ;;
+    status) show_status ;;
+    *)
+        echo "Usage: $0 {osaka|tokyo|status}"
+        exit 1
+        ;;
+esac

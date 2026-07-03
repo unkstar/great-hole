@@ -1,0 +1,18 @@
+[Unit]
+Description=great-hole-fec tunnel (%I)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/etc/great-hole/fec/%i-up.sh
+ExecStart=/usr/bin/great-hole-fec --startlua /etc/great-hole/fec/%i.lua
+ExecStopPost=/etc/great-hole/fec/%i-down.sh
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=5
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

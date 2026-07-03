@@ -7,4 +7,8 @@
 override_dh_auto_configure:
 	dh_auto_configure -- -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19
 
+override_dh_auto_install:
+	dh_auto_install
+	cp debian/tmp/usr/bin/great-hole debian/tmp/usr/bin/great-hole-fec
+
 override_dh_dwz:
