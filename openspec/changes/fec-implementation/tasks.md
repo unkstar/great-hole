@@ -62,16 +62,46 @@
 
 ## 6. Phase 6: Integration Testing
 
-- [ ] 6.1 Loopback integration test: two great-hole instances, localhost, FEC encode→loss pattern→decode round-trip
-- [ ] 6.2 Build binary (Release) and deploy to ali + osaka
-- [ ] 6.3 FEC config Lua scripts: `fec-tunnel-osaka.lua`, `fec-tunnel-ali.lua`
-- [ ] 6.4 Test connectivity ali↔osaka with FEC pipeline (ping, basic throughput)
-- [ ] 6.5 Run `fec_matrix_test.py`: loopback isolated netns, all 192 combinations
-- [ ] 6.6 Verify all 8 algorithms converge under Bernoulli (1%/5%/10%/20% loss)
-- [ ] 6.7 Verify burst-aware algorithms outperform static under Gilbert (burst loss)
-- [ ] 6.8 Verify PI and Gradient algorithms handle Sinusoidal (slowly-varying loss)
-- [ ] 6.9 Verify Step pattern response (overshoot magnitude, convergence time)
-- [ ] 6.10 Compare effective throughput: `(1-overhead)×(1-loss_rate)` across all algorithms
+- [x] 6.1 Loopback integration test: two great-hole instances, localhost, FEC encode→loss pattern→decode round-trip
+- [x] 6.2 Build binary (Release) and deploy to ali + tokyo (great-hole-fec .deb, 2026-07-04)
+- [x] 6.3 FEC config Lua scripts: `fec-tokyo-ali.lua`, `fec-tokyo.lua` (PI algo→Static, repeat_ratio=0)
+- [x] 6.4 Test connectivity ali↔tokyo with FEC pipeline (ping 59ms, tunnel UP)
+- [x] 6.5 Run `fec_matrix_test.py`: loopback isolated netns, all 192 combinations (done 2026-07-02)
+- [x] 6.6 Verify all 8 algorithms converge under Bernoulli (1%/5%/10%/20% loss) — PI best
+- [x] 6.7 Verify burst-aware algorithms outperform static under Gilbert (burst loss) — MIMD best
+- [x] 6.8 Verify PI and Gradient algorithms handle Sinusoidal (slowly-varying loss)
+- [x] 6.9 Verify Step pattern response (overshoot magnitude, convergence time)
+- [x] 6.10 Compare effective throughput across all algorithms — PI=29.8Mbps, Static=30.2Mbps
+
+## 6b. Phase 6b: Batching Debug (2026-07-04 ~ 2026-07-05)
+
+- [x] 6b.1 Identified root cause: main fiber unconditionally waits timeout_ms per cycle → 26Mbps baseline
+- [x] 6b.2 Two-fiber design: reader fiber continuously reads into batch_queue; main fiber drains with 100us poll when queue empty → 42Mbps
+- [x] 6b.3 PING/FEEDBACK overhead analyzed: UDP async_send_to completes in microseconds, NOT RTT. No gating needed.
+- [x] 6b.4 SendBatch copies=1 fast path: skip out_batch vector allocation
+- [x] 6b.5 TryRead confirmed ~70% successful (NOT "always EAGAIN" as handoff claimed) — reader gets ~3.3 pkts per Read cycle
+- [x] 6b.6 FEC overhead stats added (gated, default off): actual overhead ~5.7% at K≈17 (ceil(K*0.01)=1 → 1/17=5.9%)
+- [x] 6b.7 Nested tunnel comparison: UDPspeeder+great-hole TCP = 62Mbps vs FEC TCP = 42Mbps. UDPspeeder CWND reaches 650KB; FEC CWND capped at 350KB.
+- [x] 6b.8 Root cause conclusion: **batch delay, not FEC overhead, is the primary TCP throughput killer**. UDPspeeder (50% OH, 62Mbps) beats RaptorQ (5.7% OH, 42Mbps) because it doesn't add batch-induced delay/jitter to TCP flows.
+- [x] 6b.9 Direct link tested: TCP 101Mbps (CWND 1MB), UDP 100Mbps 0% loss. Both directions work after opening GGC firewall ports 5001/5201/10086 TCP+UDP.
+- [x] 6b.10 Boost.Asio epoll confirmed EPOLLET (edge-triggered); async_read_some does single speculative readv() -- correct per design.
+
+### Key Performance Summary
+
+| Metric | Direct | FEC (RaptorQ 1%) | Nested (UDPspeeder RS 50%) |
+|--------|--------|------------------|---------------------------|
+| TCP T→A | 101 Mbps | 42 Mbps | **62 Mbps** |
+| TCP CWND | 1 MB | 350 KB | **650 KB** |
+| TCP Retrans | 1523 | 166 | **3004** |
+| UDP 80M T→A | 79.7 (0%) | 79.5 (0%) | 66.7 (**16% loss**) |
+| UDP 100M T→A | 97.5 (0%) | 87.0 (0%) | 60.3 (**39% loss**) |
+| FEC actual OH | - | 5.7% | 50% |
+
+### Architectural Insight
+
+UDPspeeder's batch-and-send approach (Mode 0, RS GF256) allows TCP CWND to grow to 650KB despite 3004 retransmissions. FEC's four-fiber batch pipeline (RaptorQ, 4ms deadline) eliminates retransmissions but caps CWND at 350KB via ACK compression and delay jitter. For TCP throughput, **batch-induced latency hurts more than FEC overhead or even packet loss**.
+
+Future optimization: implement "send-immediately + repair-later" (UDPspeeder Mode 1 fast-send pattern) where data packets go out with zero delay and only repair symbols carry the batch latency.
 
 ## 7. Phase 7: Real-world Validation
 
