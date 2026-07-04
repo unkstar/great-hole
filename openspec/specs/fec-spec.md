@@ -961,3 +961,53 @@ p_recv = hole.fec_pipeline(udp_chan, {xor_filter}, app_chan, fec_cfg)
 
 - **Timer 集成**: `steady_timer` + `AsioUseFiber` + `Select` 在 omni-fiber 中完全可用。Pipeline 构造加 `io_context&`。
 - **Pipeline batch 模式**: `Pipeline::virtual Process()` → `FecPipeline::Process()` override。
+
+## 实测性能总结 (2026-07-05)
+
+### 测试环境
+
+- Ali (39.108.136.48) ↔ Tokyo (202.144.195.145), RTT ~60ms
+- 直连带宽: TCP 101 Mbps, UDP 100 Mbps 零丢包
+- FEC 配置: `timeout_ms=4, max_batch=20, overhead=0.01, algo=0 (Static)`
+- 编译器: Debian 13, clang-19, Boost 1.83
+
+### 吞吐量对比
+
+| 测试 | 直连 | FEC (RaptorQ) | 嵌套 (UDPspeeder RS 50%OH) |
+|------|:---:|:---:|:---:|
+| TCP T→A | 101 Mbps | **42 Mbps** | 62 Mbps |
+| TCP A→T | 95.7 Mbps | - | 49.7 Mbps |
+| TCP CWND 峰值 | 1 MB | 350 KB | 650 KB |
+| TCP 重传 | 1523 | **166** | 3004 |
+| UDP 80M | 79.7 (0%) | **79.5 (0%)** | 66.7 (16% loss) |
+| UDP 100M | 97.5 (0%) | **87.0 (0%)** | 60.3 (39% loss) |
+
+### 架构分析
+
+**FEC 编码器最终设计 (Two-fiber)**:
+
+```
+Reader fiber: co_await TUN Read() → TryRead loop (~70% hit rate, ~3.3 pkts/cycle)
+                                  → push to batch_queue
+
+Main fiber:   queue empty → 100us poll timer
+              queue data  → drain to batch
+              batch full (max_batch=20) or timeout (4ms) → SendBatch
+              SendBatch: pkt_count==1 → REPEAT copies=N (fast path)
+                         pkt_count>1  → RaptorQ K symbols + ceil(K*oh) repair
+```
+
+**关键发现**:
+
+1. **TryRead 成功率 ~70%**（非 handoff 中声称的"总是 EAGAIN"）。reader 每周期产出 ~3.3 个包。
+2. **FEC 实际开销 5.7%**（非配置的 1%）。原因: `ceil(K×0.01)` 取整，K≈17 时 ceil(0.17)=1，`1/17=5.9%`。需 K≥100 才能实现真正的 1%。
+3. **Batch 延迟是 TCP 吞吐杀手**（非 FEC 开销）。UDPspeeder (50% OH, 62 Mbps) 比 RaptorQ (5.7% OH, 42 Mbps) 快 48%，因为 UDPspeeder 不制造 ACK 压缩/延迟抖动。
+4. **FEC 消除丢包但对 TCP CWND 增长有抑制作用**：FEC TCP 重传 166 vs 直连 1523，但 CWND 仅 350 KB vs 直连 1 MB。
+5. **Boos.Asio epoll 为 EPOLLET（边沿触发）**。`async_read_some` 投机执行单次 `readv()`，配合 TryRead 循环排空缓冲。
+6. **PING/FEEDBACK 开销微秒级**（UDP async_send_to 立即完成），非 RTT 延迟。无需隔离到 batch 之间。
+
+### 未来改进方向
+
+1. **即发后补 (send-immediately + repair-later)**: 数据包到达即发送（REPEAT copies=1，零延迟），凑够 K 个后补发 RaptorQ 修复符号。需改造 wire format（包对齐 symbol 边界）和 decoder（REPEAT + repair 符号混合解码）。
+2. **减小 max_batch + 增大 timeout**: 减少 batch 突发度，降低 ACK 压缩效应。
+3. **解码端 pace 输出**: 解码后的原始包以微间隔输出到 TUN，避免 TCP ACK 爆发。
