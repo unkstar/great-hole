@@ -1011,3 +1011,29 @@ Main fiber:   queue empty → 100us poll timer
 1. **即发后补 (send-immediately + repair-later)**: 数据包到达即发送（REPEAT copies=1，零延迟），凑够 K 个后补发 RaptorQ 修复符号。需改造 wire format（包对齐 symbol 边界）和 decoder（REPEAT + repair 符号混合解码）。
 2. **减小 max_batch + 增大 timeout**: 减少 batch 突发度，降低 ACK 压缩效应。
 3. **解码端 pace 输出**: 解码后的原始包以微间隔输出到 TUN，避免 TCP ACK 爆发。
+
+## 追加发现 (2026-07-05 深夜调试)
+
+### FEC 版 Pipeline 基类改动导致 nofec 性能退化 3 倍
+
+使用原始 great-hole 二进制（Ali-Osaka 版本）和 FEC 版 great-hole-fec 二进制，运行**完全相同的 nofec 配置**对比：
+
+| 版本 | 配置 | 吞吐 | CWND |
+|------|------|------|------|
+| 原始 great-hole (v0.2.0) | XOR + Pipeline | **93.9 Mbps** | 596-748 KB |
+| great-hole-fec (当前分支) | XOR + Pipeline (同配置) | **27.7 Mbps** | 287-321 KB |
+| great-hole-fec | FecPipeline (RaptorQ) | 38-45 Mbps | 246-361 KB |
+
+**结论：FEC 分支对 Pipeline 基类的改动（`virtual Process()` + `io_context&`）破坏了普通 Pipeline 的性能，即使不使用 FecPipeline 也受影响。** FecPipeline 自身的 batch 延迟进一步降低了吞吐。原始二进制恢复后隧道吞吐从 27.7 恢复到 93.9 Mbps。
+
+### ER-X 硬件瓶颈
+
+Ali↔ER-X 间 WireGuard 性能非对称：
+- ER-X **接收** (Ali→ER-X): 145 Mbps — 解密快
+- ER-X **发送** (ER-X→Ali): **48 Mbps** — MT7621A CPU 加密上限
+
+Google 测速下载 47.7 Mbps 即受限于 ER-X WireGuard 发送能力。上传 7.5 Mbps 是因为 Google 选中香港服务器（325ms RTT）导致 TCP BDP 受限。
+
+### 出口切换持久化
+
+`switch-exit` 脚本已更新：切换出口时写入 `/etc/great-hole/fec/exit-target`，`wg0.conf` PostUp 读取此文件决定使用 table 101 (Osaka) 或 table 102 (Tokyo)。WireGuard 重启/服务器重启后出口选择保持不变。
