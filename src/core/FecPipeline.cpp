@@ -285,6 +285,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
     uint32_t pkt_count = static_cast<uint32_t>(batch.size());
     uint32_t group_seq = ++_GroupSeq;
     uint32_t flags = BuildFlags();
+    uint32_t out_symbols = 0; // set in each path for stats
     float adaptive_ratio = _Cfg.repeat_ratio;
     if (_OverheadCtrl) {
         float oh = _OverheadCtrl->GetOverhead();
@@ -292,8 +293,10 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
         frac = std::clamp(frac, 0.0f, 1.0f);
         adaptive_ratio = _Cfg.repeat_ratio_min + (_Cfg.repeat_ratio_max - _Cfg.repeat_ratio_min) * frac;
     }
+
     if (pkt_count == 1) {
         uint32_t copies = static_cast<uint32_t>(std::ceil(adaptive_ratio)) + 1;
+        out_symbols = copies;
         auto& pkt = batch[0];
         std::vector<uint8_t> iv;
         if (flags & 0x0E) { iv.resize(_Cfg.iv_len); for (auto& b : iv) b = static_cast<uint8_t>(std::rand() & 0xFF); }
@@ -334,6 +337,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
         float current_overhead = _OverheadCtrl ? _OverheadCtrl->GetOverhead() : _Cfg.overhead;
         uint32_t extra = static_cast<uint32_t>(std::ceil(K * current_overhead));
         uint32_t total_symbols = K + extra;
+        out_symbols = total_symbols;
         if (total_symbols > 65535) total_symbols = 65535;
         bool use_2b = (total_symbols > 255) || (K > 255);
         uint8_t final_flags = static_cast<uint8_t>(flags);
@@ -358,6 +362,15 @@ Omni::Fiber::Coroutine<void> FecPipeline::SendBatch(std::vector<Packet>& batch) 
         }
         if (!out_batch.empty()) { auto err = co_await _Out->WriteBatch(out_batch, _Stop); if (err && IsCritical(err)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") FEC write error: " << err.message(); throw SystemError(err, "FecPipeline FEC write error"); } }
     }
+    // FEC overhead stats (100-batch sliding window). Set LOG_N>0 to enable.
+    { static constexpr int W=100, LOG_N=0; static uint64_t wi=0,wo=0,ti=0,to=0,wn=0,ln=0;
+      wi+=pkt_count; wo+=out_symbols; ti+=pkt_count; to+=out_symbols;
+      if (++wn>=W) { if (LOG_N>0 && ++ln>=LOG_N) { ln=0;
+          float wr=(float)wo/(float)wi, ar=(float)to/(float)ti;
+          BOOST_LOG_TRIVIAL(info)<<"FEC-STAT win"<<W<<" in="<<wi<<" out="<<wo
+            <<" oh="<<(wr-1.0f)*100<<"% | total in="<<ti<<" out="<<to
+            <<" oh="<<(ar-1.0f)*100<<"%"; }
+          wi=0;wo=0;wn=0; } }
     co_return;
 }
 
