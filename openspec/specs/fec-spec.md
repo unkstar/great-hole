@@ -1060,3 +1060,27 @@ Google 测速下载 47.7 Mbps 即受限于 ER-X WireGuard 发送能力。上传 
 3. **调参有效**: timeout_ms 4→1 + max_batch 200→20 使 FEC TCP 3.8→16.1 Mbps (×4)。
 4. **直连 TCP 方向不对称** (T→A 36~69 vs A→T 91.7) — 国际链路波动，非隧道问题。
 5. FEC UDP 与直连的差距 (27 vs 95M) 全部来自编码 CPU，非链路或配置。
+
+## Batch 延迟假说验证 (2026-08-05) — 旧结论修正
+
+> 旧结论 (2026-07-05): "Batch 延迟是 TCP 吞吐杀手" — **实测证伪，已修正**
+
+### 代码事实
+
+`SendBatch` FEC 路径 (FecPipeline.cpp:327-363): `BuildBlob`（攒全部包）→ 一次性 `rq.Encode(blob)` → 循环 `GenerateSymbol` → 最后 `WriteBatch` 整体发出。**第一个符号确实必须等整组编码完成** — "攒够全组才能开始生成第一个包"属实。
+
+### 实测对照 (tokyo 1vCPU, 2026-08-05)
+
+| 配置 | 组延迟 | TCP | UDP 80M |
+|------|:---:|:---:|:---:|
+| timeout=1ms, max_batch=20 | 低 | 16.1M | 27.0M |
+| **max_batch=1** (单包 REPEAT 快路径) | **零** | **16.7M** | **53.4M** |
+| timeout=8ms, max_batch=200 | 高 | **21.3M** | - |
+
+### 结论
+
+1. **组延迟与 TCP 吞吐无相关性** (batch=1 零延迟 TCP 仍 16.7M；8ms 长延迟反而 21.3M) — "batch 延迟导致 TCP 差"证伪。
+2. **TCP 瓶颈 = 单核 CPU 饱和**: TCP 测试中 great-hole-fec 进程 CPU 达 99.9% (双向数据+ACK 都要 FEC 编解码)。UDP 单向编码 → CPU 限制点不同。
+3. **RaptorQ 每包开销 > speederv2 GF256 档位编码**: 生产嵌套 (speederv2, 小包 1:1 复制) TCP 38.9M vs great-hole FEC 16-24M，同为单核。
+4. UDP 受编码 CPU 限制: batch=20 时 RaptorQ 编码 27M；batch=1 REPEAT 无编码 53.4M — 印证 RaptorQ 编码是 CPU 大头。
+5. **推论**: 提升 FEC TCP 吞吐的正路 = 减每包 CPU 开销 (ACK/小包走 REPEAT copies=1 直发, 仅大包 RaptorQ) + 多核，而非调 batch 延迟。
