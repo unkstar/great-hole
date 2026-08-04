@@ -1037,3 +1037,26 @@ Google 测速下载 47.7 Mbps 即受限于 ER-X WireGuard 发送能力。上传 
 ### 出口切换持久化
 
 `switch-exit` 脚本已更新：切换出口时写入 `/etc/great-hole/fec/exit-target`，`wg0.conf` PostUp 读取此文件决定使用 table 101 (Osaka) 或 table 102 (Tokyo)。WireGuard 重启/服务器重启后出口选择保持不变。
+
+## 实测性能基线 (2026-08-05, 新 Tokyo 1vCPU)
+
+> **测试环境**: Ali (39.108.136.48) ↔ Tokyo (202.144.195.103, 2026-08-04 重建), RTT ~65ms
+> **Tokyo 规格**: Debian 13, **1 vCPU** (AMD EPYC-Rome), 1.9GB RAM, ~23% steal time
+> **测试链路**: fec-test 专用隧道 (UDP 20086 直连, 不经 speederv2), TUN 172.31.40.0/30, MTU 1420
+> **FEC 配置**: timeout_ms=1, max_batch=20, overhead=1% PI (algo=3), symbol_size=1440
+
+| 测试 | 直连 | FEC 隧道 | 说明 |
+|------|:---:|:---:|------|
+| TCP T→A | 36~69 Mbps | **16.1 Mbps** | 直连波动大 (链路质量波动) |
+| TCP A→T | 91.7 Mbps | **13.7 Mbps** | 方向不对称 |
+| UDP 80M T→A | 76.4 (0%) | **27.0 Mbps** | |
+| UDP 100M T→A | 95.4 (0%) | - | |
+| UDP 80M A→T | - | **25.1 Mbps** | iperf3 lost% 因 FEC 重排失真 |
+
+### 关键结论
+
+1. **新 Tokyo 链路直连能力完好** (UDP 95M / TCP 91.7M A→T)，重建实例无带宽损失。
+2. **FEC 编码器吞吐上限 ~27 Mbps (双向一致)** — 1 vCPU 是硬瓶颈 (RaptorQ 编码 + 双 fiber + 23% steal)。历史 42Mbps 数据来自旧 Tokyo 多核实例。
+3. **调参有效**: timeout_ms 4→1 + max_batch 200→20 使 FEC TCP 3.8→16.1 Mbps (×4)。
+4. **直连 TCP 方向不对称** (T→A 36~69 vs A→T 91.7) — 国际链路波动，非隧道问题。
+5. FEC UDP 与直连的差距 (27 vs 95M) 全部来自编码 CPU，非链路或配置。

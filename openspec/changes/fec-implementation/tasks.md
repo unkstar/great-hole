@@ -105,10 +105,10 @@ Future optimization: implement "send-immediately + repair-later" (UDPspeeder Mod
 
 ## 7. Phase 7: Real-world Validation
 
-- [ ] 7.1 Deploy to ali-osaka production-like config with FEC enabled
-- [ ] 7.2 Long-duration iperf3 TCP throughput test (1h+) with FEC vs baseline
-- [ ] 7.3 Long-duration iperf3 UDP test with FEC vs baseline
-- [ ] 7.4 Measure actual overhead in steady state for best algorithm
+- [ ] 7.1 Deploy to ali-osaka production-like config with FEC enabled (测试专用链路 fec-test 已搭好, 2026-08-05)
+- [~] 7.2 iperf3 TCP 短时测试已跑 (FEC 13.7~16.1M vs 直连 36~92M), 1h+ 长时未做
+- [~] 7.3 iperf3 UDP 短时测试已跑 (FEC ~25-27M vs 直连 76-95M), 1h+ 长时未做
+- [x] 7.4 实际 overhead 与吞吐上限已测量: **1 vCPU 是 FEC 编码器瓶颈 (~27Mbps)** — 结果见 fec-spec.md 2026-08-05 基线
 - [ ] 7.5 Document recommended algorithm + config for different link profiles
 - [ ] 7.6 24h+ stability soak test (no memory leaks, no ring buffer issues)
 
