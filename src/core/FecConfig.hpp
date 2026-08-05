@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace gh {
 
 struct FecConfig {
+    std::string fec_codec = "lcrq";    // "lcrq" (RFC 6330 RaptorQ, default) | "rs" (Vandermonde GF256)
     uint32_t timeout_ms = 4;           // batch maximum wait time (min 1)
     float overhead = 0.15f;            // initial redundancy ratio
     float max_overhead = 0.50f;        // adaptive overhead upper limit

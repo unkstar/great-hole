@@ -22,6 +22,7 @@ foreach(suffix "" "-asan")
     EndpointUdpDynMux.cpp
     FecPipeline.cpp
     LossPattern.cpp
+    RS256.cpp
     RaptorQ.cpp
   )
 
