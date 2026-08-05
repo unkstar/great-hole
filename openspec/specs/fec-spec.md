@@ -1128,3 +1128,39 @@ rq_symbol ×18  0.06-0.10 ms (可忽略)
 - FEC 隧道 UDP 27M = lcrq K≤200 编码上限 (~30M) − UDP I/O 开销, **集成无额外损失**。
 - 研究数据 (osaka 563M / ali 1769M, "K=32K symbols") 在两台机器当前构建下**不可复现** (K=1000 已崩至 8.9M, K=32K init >20min; K=17~200 全区间 ~30M) — 研究数据存疑。
 - **突破路径不变**: REPEAT 快路径 (batch=1 UDP 53.4M 已证) 或换 AVX-512 实例 (未验证, 云 vCPU 普遍不暴露 avx512)。
+
+## AVX-512 实锤 (2026-08-05) — 同一二进制三机对照
+
+### 决定性实验: tokyo 编译 (-O3 -march=native) 的同一 lcrq-speedtest 二进制在 3 台机器跑 K=17
+
+| 机器 | CPU | AVX-512 | K=17 编码 | 倍数 |
+|------|-----|:---:|:---:|:---:|
+| tokyo | AMD EPYC-Rome 1vCPU | 无 (云未透传) | 31.4 Mbps | 1× |
+| osaka | Xeon (Cascadelake) | 无 | 31.9 Mbps | 1× |
+| **ali** | Xeon Platinum | **有 (f/bw/cd/dq/vl)** | **241.5 Mbps** | **7.7×** |
+
+ali K=200: 183.1 Mbps。
+
+### 为什么 -O3 不是瓶颈（信服解释）
+
+1. lcrq 热路径 = **手写 SIMD intrinsics** (gf256_avx2.c / matrix_avx512.c)。intrinsics 编译为固定 SIMD 指令，**编译器 -O 级别不影响 intrinsics 执行** — 这是 -O0/-O3 无差异的根本原因。
+2. 无 AVX-512 时走标量/查表路径，编译器优化对查表+位操作提升有限 (31.4→32.7M, +4%)。
+3. 同一二进制在 ali 快 7.7 倍 = 纯指令集差异。**瓶颈 = AVX-512 可用性，不是优化级别**。
+
+### 研究数据 (1769M) 溯源
+
+- ali (AVX-512) 是研究基准机 — 数据真实但仅代表 AVX-512 机器 + K=32K 摊薄。
+- tokyo/osaka 云 vCPU 未透传 avx512 → 实际部署场景只有 ~30M。
+- **fec-research.md 的吞吐数据必须标注"仅 AVX-512 机器有效"**。
+
+### 对隧道的影响
+
+- tokyo 端编/解码均 ~30M (无 AVX-512) → FEC 隧道双向都受 tokyo 限制 (~27M UDP) — 与实测一致。
+- ali 端编码 241M → 若 tokyo 换 AVX-512 实例, FEC 隧道可提升 ~7.7×。
+- REPEAT 快路径 (53.4M) 仍是无 AVX-512 环境下的唯一现实突破。
+
+### 构建文件修复 (同批提交)
+
+- 丢失的 `libs/lcrq/CMakeLists.txt` 从 ali 部署副本找回 → 正式化为 `cmake/lcrq.cmake` (ExternalProject + IMPORTED target)。
+- 主 CMakeLists.txt: `add_subdirectory(libs/lcrq)` → `include(cmake/lcrq.cmake)`。
+- tokyo 全新建树验证可复现。

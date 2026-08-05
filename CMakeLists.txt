@@ -30,5 +30,5 @@ find_package(GTest REQUIRED)
 set(OMNIFIBER_INTERNAL ON CACHE BOOL "" FORCE)
 
 add_subdirectory(libs/omni-fiber)
-add_subdirectory(libs/lcrq)
+include(cmake/lcrq.cmake)
 add_subdirectory(src)
