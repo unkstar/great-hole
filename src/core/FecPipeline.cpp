@@ -486,13 +486,14 @@ Omni::Fiber::Coroutine<void> FecPipeline::ProcessRsEncode() {
         const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
         const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
 
-        // small packets (<256B payload) or oversized: direct send, no RS protection
+        // small packets (<256B payload) or oversized: direct send, no RS protection.
+        // seq=0: small shards do NOT consume RS sequence space (RS batch seqs stay contiguous).
         if (dlen + 2 > T || dlen < 256) {
             Packet out; out._Length = 0;
             out.PushBack(p.Data());
             out.PushFrontLE(static_cast<uint16_t>(dlen));
             out.PushFrontLE(fb);
-            out.PushFrontLE(BuildDword(++_RsSeq, kRsSmall));
+            out.PushFrontLE(BuildDword(0, kRsSmall));
             auto werr = co_await _Out->Write(out, _Stop);
             if (werr && IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") RS write error: " << werr.message(); throw SystemError(werr, "FecPipeline RS write error"); }
             continue;
@@ -647,8 +648,19 @@ Omni::Fiber::Coroutine<void> FecPipeline::ProcessRsDecode() {
         if (!_RsHaveWatermark) { _RsHaveWatermark = true; _RsDeliverSeq = seq - 1; }
         co_await RsFlushDelivery();
 
-        // stale batch cleanup: force watermark past batches that can no longer recover
+        // Global watermark stall guard: if delivery stalled past decode_timeout
+        // (missing shard whose repairs never arrived), skip the gap and continue.
         const auto now = std::chrono::steady_clock::now();
+        if (_RsHaveWatermark && now - _RsLastFlushTime > std::chrono::milliseconds(_Cfg.decode_timeout_ms)) {
+            auto gap = _RsSrcs.lower_bound(_RsDeliverSeq + 1);
+            if (gap != _RsSrcs.end() && gap->first > _RsDeliverSeq + 1) {
+                _RsDeliverSeq = gap->first - 1;
+                BOOST_LOG_TRIVIAL(warning) << "FecPipeline(" << this << ") RS watermark stall: skipped " << (gap->first - 1 - _RsDeliverSeq) << " missing shards";
+            }
+            _RsLastFlushTime = now;
+        }
+
+        // stale batch cleanup: force watermark past batches that can no longer recover
         for (auto it = _RsBatchTime.begin(); it != _RsBatchTime.end();) {
             if (now - it->second > std::chrono::milliseconds(_Cfg.decode_timeout_ms)) {
                 const uint32_t k = _RsBatchK.count(it->first) ? _RsBatchK[it->first] : 0;
@@ -673,6 +685,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::RsFlushDelivery() {
         const uint32_t next = _RsDeliverSeq + 1;
         auto it = _RsSrcs.find(next);
         if (it == _RsSrcs.end()) break;
+        _RsLastFlushTime = std::chrono::steady_clock::now();
         const auto& payload = it->second;
         const uint16_t len = static_cast<uint16_t>(payload[0]) | (static_cast<uint16_t>(payload[1]) << 8);
         if (payload.size() < 2 + len) { _RsSrcs.erase(it); _RsDeliverSeq++; continue; }
