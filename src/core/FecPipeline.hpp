@@ -64,6 +64,8 @@ private:
     // === RS codec (Vandermonde GF256) ===
     Omni::Fiber::Coroutine<void> ProcessRsEncode();
     Omni::Fiber::Coroutine<void> ProcessRsDecode();
+    Omni::Fiber::Coroutine<void> RsHandleEncodePacket(Packet&& p);
+    Omni::Fiber::Coroutine<void> RsHandleDecodePacket(Packet&& p);
     Omni::Fiber::Coroutine<void> SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq);
     Omni::Fiber::Coroutine<void> RsFlushDelivery();
     void RsTryRecover(uint32_t bid, uint32_t k);
