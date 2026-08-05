@@ -503,7 +503,12 @@ Omni::Fiber::Coroutine<void> FecPipeline::RsHandleEncodePacket(Packet&& p) {
     const uint32_t T = rs_symbol_size(_Cfg);
     const auto timeout = std::chrono::milliseconds(_Cfg.timeout_ms);
     const size_t dlen = p.DataSize();
-    BOOST_LOG_TRIVIAL(info) << "RS-ENC in=" << dlen;
+    if (dlen > 0) {
+        const uint8_t* d = p.Data().data();
+        BOOST_LOG_TRIVIAL(info) << "RS-ENC in=" << dlen << " hdr=" << std::hex
+            << (int)d[0] << "," << (int)d[1] << "," << (int)d[2] << "," << (int)d[3] << ","
+            << (int)d[12] << "," << (int)d[13] << "," << (int)d[14] << "," << (int)d[15] << std::dec;
+    }
     if (dlen == 0) co_return;
     const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
     const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
