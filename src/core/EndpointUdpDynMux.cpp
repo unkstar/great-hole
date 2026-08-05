@@ -256,19 +256,15 @@ UdpDynMux::Channel::HandleControlPacket(boost::asio::ip::udp::endpoint peer, Pac
         BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (tx matched) from " << peer;
       }
 
-      if (!myRxMatches) {
-        // Keep negotiating: reply and stay in the negotiating loop. Without
-        // this, a passive side (no peer resolver) that receives an initiate
-        // with a stale PeerRxId replies once and then returns kRunning, while
-        // the active peer (its my-rx matched) never re-initiates — the passive
-        // side would wait forever in negotiating. Returning kNegotiating lets
-        // both sides exchange initiates until PeerRxId converges.
-        BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (my rx mismatch) sending initiate to " << peer;
-        co_await _Parent.SendControlInitiate(peer, init->Psk, _LocalRxId, _RemoteRxId);
-        co_return State::kNegotiating;
-      }
-
-      co_return State::kRunning;
+      // Always reply to initiate (symmetric handshake). PeerRxId propagation is
+      // one-way: only the sender of an initiate carries its view of the peer's
+      // RxId, so the side whose PeerRxId is stale can never converge unless the
+      // peer replies. Replying unconditionally lets both sides converge in a few
+      // rounds; once our PeerRxId matches, we return kRunning and stop sending,
+      // and the peer (now matching) stops too.
+      BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (my rx " << (myRxMatches ? "matched" : "mismatch") << ") replying to " << peer;
+      co_await _Parent.SendControlInitiate(peer, init->Psk, _LocalRxId, _RemoteRxId);
+      co_return myRxMatches ? State::kRunning : State::kNegotiating;
     }
   } else if (msgType == static_cast<uint8_t>(UdpDynMuxProto::MsgType::kKeepalive)) {
     if (auto ping = UdpDynMuxProto::Keepalive::Deserialize(packet.Data())) {
