@@ -24,7 +24,7 @@ ExternalProject_Add(lcrq_ext
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND ${LCRQ_SRC}/configure
     BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -C src
-    INSTALL_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/cmake/lcrq-install.sh ${LCRQ_INSTALL_DIR} ${CMAKE_AR}
+    INSTALL_COMMAND /bin/sh ${CMAKE_CURRENT_SOURCE_DIR}/cmake/lcrq-install.sh ${LCRQ_INSTALL_DIR} ${CMAKE_AR}
     BUILD_BYPRODUCTS ${LCRQ_INSTALL_DIR}/lib/liblcrq.a
 )
 
