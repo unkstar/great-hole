@@ -1164,3 +1164,18 @@ ali K=200: 183.1 Mbps。
 - 丢失的 `libs/lcrq/CMakeLists.txt` 从 ali 部署副本找回 → 正式化为 `cmake/lcrq.cmake` (ExternalProject + IMPORTED target)。
 - 主 CMakeLists.txt: `add_subdirectory(libs/lcrq)` → `include(cmake/lcrq.cmake)`。
 - tokyo 全新建树验证可复现。
+
+## 终极归因 (2026-08-05) — tokyo vCPU 算力配额是唯一瓶颈
+
+### 决定性实验链
+
+1. **AVX2 vs AVX512 无差异**: ali 同机同 -O0 库, 仅切换调度路径 — avx512 216.0M vs avx2-only 212.6M (≈相同)。lcrq 的 shuffle 查表 SIMD 瓶颈在内存访问, 不在向量宽度。**"avx2 重写提速"不成立 — AVX2 已启用且与 AVX512 等价**。
+2. **机器算力差距 6.6 倍**: 同一库 (avx2-only, -O0): tokyo 32.5M vs ali 216M。
+3. **CPU 基准**: tokyo 标称 2794 MHz 但 30M 整数循环 9.8s vs ali (2500 MHz) 3.8s — **tokyo vCPU 实际算力只有 ali 的 ~38%** (2.6×), SIMD/内存密集任务放大到 6.6×。
+
+### 结论
+
+- lcrq 无 avx512 时回退 **AVX2** (非 SSE2, cpu.c 逐级检测 + matrix.c 调度正确, 已实证)。
+- **FEC 27M 瓶颈 = GGC tokyo vCPU 算力配额** (超售/节流), 与指令集、优化级别、batch 延迟、集成均无关。
+- **提速正路**: 换更高算力 vCPU (同 ali 算力即可 ~200M, 无需 AVX-512), 或减少 RaptorQ 使用 (REPEAT 快路径 53.4M)。
+- 客服邮件应诉求: CPU 配额/节点超售, 而非 AVX-512。
