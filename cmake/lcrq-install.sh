@@ -1,0 +1,16 @@
+#!/bin/sh
+# Package lcrq .o files into a static archive (lcrq builds .so only via its
+# autotools; configure ignores --enable-static). Called by cmake/lcrq.cmake
+# ExternalProject INSTALL_COMMAND. Usage: lcrq-install.sh <install-dir> <ar>
+set -e
+
+INSTALL_DIR="$1"
+AR="$2"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LCRQ_SRC="$SCRIPT_DIR/../libs/lcrq"
+
+mkdir -p "$INSTALL_DIR/lib"
+cd "$LCRQ_SRC"
+
+# find -print0 | xargs -0 avoids glob/quote issues entirely
+find src -maxdepth 1 -name '*.o' -print0 | xargs -0 "$AR" rcs "$INSTALL_DIR/lib/liblcrq.a"
