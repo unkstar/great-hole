@@ -33,7 +33,6 @@ foreach(suffix "" "-asan")
     BOOST_ASIO_ENABLE_OLD_SERVICES
     BOOST_ASIO_DISABLE_HANDLER_TYPE_REQUIREMENTS
     BOOST_ASIO_HAS_MOVE
-    BOOST_ASIO_DISABLE_EPOLL
   )
 
   target_link_libraries(${target} PUBLIC
