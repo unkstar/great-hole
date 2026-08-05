@@ -36,6 +36,8 @@ Omni::Fiber::Coroutine<ErrorCode> UdpMux::DoStart() {
   try {
     _Socket.open(boost::asio::ip::udp::v6());
     _Socket.set_option(boost::asio::ip::v6_only(false));
+    _Socket.set_option(boost::asio::socket_base::send_buffer_size(4 * 1024 * 1024));
+    _Socket.set_option(boost::asio::socket_base::receive_buffer_size(4 * 1024 * 1024));
     _Socket.bind(_Local);
     BOOST_LOG_TRIVIAL(info) << "UdpMux(" << this << ") bound at " << _Socket.local_endpoint();
   } catch (const SystemError& e) {
