@@ -1084,3 +1084,24 @@ Google 测速下载 47.7 Mbps 即受限于 ER-X WireGuard 发送能力。上传 
 3. **RaptorQ 每包开销 > speederv2 GF256 档位编码**: 生产嵌套 (speederv2, 小包 1:1 复制) TCP 38.9M vs great-hole FEC 16-24M，同为单核。
 4. UDP 受编码 CPU 限制: batch=20 时 RaptorQ 编码 27M；batch=1 REPEAT 无编码 53.4M — 印证 RaptorQ 编码是 CPU 大头。
 5. **推论**: 提升 FEC TCP 吞吐的正路 = 减每包 CPU 开销 (ACK/小包走 REPEAT copies=1 直发, 仅大包 RaptorQ) + 多核，而非调 batch 延迟。
+
+## lcrq 复测 (2026-08-05) — 研究数据失真确认
+
+> 研究阶段 (fec-research.md) 记录: osaka 563Mbps / ali 1769Mbps (K=32K symbols, T=1024)
+> **复测 (tokyo 1vCPU AMD EPYC-Rome, lcrq v0.3.1, 官方 examples/speedtest.c):**
+
+| K | T | 编码 | 解码 | 备注 |
+|:--:|:--:|:---:|:---:|------|
+| 17 | 1440 | **31.4 Mbps** | 30.2 Mbps | 我们的实际组大小 (max_batch=20) |
+| 17 | 1440 | 34.2 Mbps (-O3) | 30.8 | 优化级别无影响 |
+| 200 | 1024 | 31.0 Mbps | 30.3 | |
+| 1000 | 1024 | 8.9 Mbps | - | K 增大 init 开销 O(K²) 反噬 |
+| 32768 | 1024 | (init >20min 未完成) | - | 研究参数在本机不可行 |
+
+### 结论
+
+1. **lcrq 小 K (K≤200) 在 tokyo 单核实测 ~30 Mbps** — 与我们 FEC 隧道 UDP 27M **完全吻合**。集成无额外损失，瓶颈就是 lcrq 编码本身。
+2. **研究数据失真**: 563/1769 Mbps 来自 **AVX-512 CPU (osaka Cascadelake / ali Xeon Platinum) + K=32K 摊薄**。tokyo EPYC-Rome **无 AVX-512**，且 K=32K 的 rq_init O(K²) 矩阵预计算在本机 >20 分钟 — 研究参数在部署环境不可复现。
+3. **-Og 与 -O3 无差异** (31.4 vs 34.2M) — 优化级别不是原因。
+4. **修正归因**: "batch 延迟"假说证伪 → "CPU 饱和"现象属实 → 根因 = **lcrq 小 K 编码吞吐 (无 AVX-512 时 ~30Mbps)**。REPEAT 快路径 (batch=1, UDP 53.4M) 绕过 RaptorQ 是当前唯一有效提速手段。
+5. **推论**: FEC 隧道吞吐上限 = min(链路, lcrq 小K编码吞吐)。换 AVX-512 实例或减少 RaptorQ 组 (ACK/小包 REPEAT 直发) 才能突破。
