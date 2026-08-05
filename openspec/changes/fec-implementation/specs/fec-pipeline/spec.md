@@ -111,6 +111,58 @@ The system SHALL expose `hole.fec_pipeline()` and `hole.fec_shared_state()` in t
 - **WHEN** Lua calls `hole.fec_shared_state()`
 - **THEN** the system SHALL return a FecSharedState object that can be passed to both encode and decode pipelines
 
+### Requirement: Codec Strategy Abstraction
+The FEC pipeline SHALL be structured as a transport layer plus a pluggable codec strategy. A codec SHALL be a pure synchronous processor: it SHALL NOT perform I/O, SHALL NOT suspend (no co_await), and SHALL NOT own fibers. All I/O and fiber scheduling SHALL live in the single transport implementation.
+
+#### Scenario: Codec interface
+- **WHEN** the transport receives a packet from its input
+- **THEN** it SHALL call `codec.OnPacket(packet, out)` synchronously
+- **AND** the codec SHALL append all outbound packets to the caller-provided `out` vector
+
+#### Scenario: Codec idle tick
+- **WHEN** the transport poll timer fires (100µs) while the queue is idle
+- **THEN** the transport SHALL call `codec.Tick(out)` so the codec can flush deferred output (encoder repair batches, decoder watermark recovery)
+
+#### Scenario: Codec selection
+- **WHEN** `fec_codec = "rs"`
+- **THEN** the pipeline SHALL instantiate the RS codec (Vandermonde GF256)
+- **WHEN** `fec_codec = "lcrq"` (default)
+- **THEN** the pipeline SHALL instantiate the RaptorQ codec
+
+### Requirement: Transport Read Loop
+The transport SHALL keep exactly one pending asynchronous read on the input endpoint at all times, via a dedicated reader fiber feeding a FIFO queue. The input descriptor SHALL NOT be left unregistered with the reactor while the worker processes or writes.
+
+#### Scenario: Reader fiber
+- **WHEN** the pipeline starts
+- **THEN** a reader fiber SHALL issue the next async read immediately after each read completes
+- **AND** SHALL push received packets into a `std::deque` FIFO queue
+
+#### Scenario: Worker fiber
+- **WHEN** the queue is non-empty
+- **THEN** the worker fiber SHALL pop the front packet (O(1)) and pass it to `codec.OnPacket`
+- **AND** SHALL write each packet appended to `out` to the output endpoint
+
+#### Scenario: Idle queue
+- **WHEN** the queue is empty and the reader has not finished
+- **THEN** the worker SHALL wait on the 100µs poll timer before re-checking, and SHALL call `codec.Tick(out)` each cycle
+
+### Requirement: Container Discipline (hot path)
+The FEC hot path SHALL NOT use associative containers (`std::map`), content-based linear scans, or per-packet heap allocation for state indexed by sequence/batch id.
+
+#### Scenario: Decode-side shard storage
+- **WHEN** a source shard is cached by sequence number
+- **THEN** it SHALL be stored in a fixed-size ring of slots indexed by `seq & (N-1)` (power of two, N >> max in-flight shards)
+- **AND** each slot SHALL validate the stored seq and retain its payload vector capacity across packets
+
+#### Scenario: Repair storage
+- **WHEN** repairs are buffered by batch id
+- **THEN** they SHALL use the same fixed-slot ring pattern indexed by `bid & (N-1)`
+
+#### Scenario: Inter-fiber queues and codec output
+- **WHEN** packets move between the reader and worker fibers
+- **THEN** the queue SHALL be a `std::deque` (O(1) push_back / pop_front), NOT a vector with front-erase
+- **AND** the codec output vector SHALL be reused across calls (clear between calls, capacity retained)
+
 ### Requirement: IV XOR Obfuscation
 When `obfuscate = true`, the system SHALL XOR data with a random IV before transmission.
 

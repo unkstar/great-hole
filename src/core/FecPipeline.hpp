@@ -2,10 +2,11 @@
 
 #include <chrono>
 #include <cstdint>
-#include <map>
+#include <deque>
 #include <memory>
 #include <vector>
 
+#include "FecCodec.hpp"
 #include "FecConfig.hpp"
 #include "Pipeline.hpp"
 
@@ -14,21 +15,12 @@ namespace gh {
 class AdaptiveOverhead;
 class LossPattern;
 
-// Shared state between encoder and decoder on the same side.
-// Used for PING/FEEDBACK loop and RTT measurement.
-struct FecSharedState {
-    // Decoder writes when PING received, encoder reads & sends FEEDBACK then clears
-    uint64_t pending_feedback_echo = 0;
-    // Decoder updates when FEEDBACK received (RTT EWMA in microseconds)
-    uint64_t rtt_ewma_us = 0;
-    // Encoder writes timestamp of last sent PING
-    uint64_t last_ping_sent_us = 0;
-    // Consecutive PINGs lost (encoder increments on timeout)
-    uint32_t consecutive_ping_lost = 0;
-    // Latest measured loss rate from decoder [0..1] (encoder reads for feedback byte)
-    float latest_loss_rate = 0.0f;
-};
-
+// Transport layer for FEC. Owns all reads/writes and fiber scheduling; the
+// FEC algorithm is a pluggable FecCodec strategy (pure synchronous processor,
+// no I/O, no suspension). A dedicated reader fiber keeps an async read
+// pending on the input at all times (descriptor always registered with the
+// reactor); a worker fiber drains the deque and calls codec->OnPacket, then
+// writes the codec's output.
 class FecPipeline : public Pipeline {
 public:
     FecPipeline(boost::asio::io_context& io, std::shared_ptr<EndpointInput> in,
@@ -41,62 +33,12 @@ protected:
     Omni::Fiber::Coroutine<void> Process() override;
 
 private:
-    // Wire format flags
-    enum Flags : uint8_t {
-        kWidth1B = 0,
-        kWidth2B = 1 << 0,
-        kFlagsMask = 0x0F,
-        kPing = 1 << 4,
-        kFeedback = 1 << 5,
-        kRepeat = 1 << 6,
-        kEcho = 1 << 7,
-    };
-    // RS codec flags (fec_codec="rs"): bit3 = direct small packet (no RS),
-    // bit6 reused as RS repair shard marker (kRepeat never set in RS mode).
-    enum RsFlags : uint8_t {
-        kRsSmall = 1 << 3,
-        kRsRepair = 1 << 6,
-    };
-
     uint8_t BuildFlags() const;
     uint32_t BuildDword(uint32_t group_seq, uint8_t flags) const;
 
-    // === RS codec (Vandermonde GF256) ===
-    Omni::Fiber::Coroutine<void> ProcessRsEncode();
-    Omni::Fiber::Coroutine<void> ProcessRsDecode();
-    Omni::Fiber::Coroutine<void> RsHandleEncodePacket(Packet&& p);
-    Omni::Fiber::Coroutine<void> RsHandleDecodePacket(Packet&& p);
-    Omni::Fiber::Coroutine<void> SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq);
-    Omni::Fiber::Coroutine<void> RsFlushDelivery();
-    void RsTryRecover(uint32_t bid, uint32_t k);
-
-    // Encode helpers
-    Omni::Fiber::Coroutine<void> SendBatch(std::vector<Packet>& batch);
-    void BuildBlob(const std::vector<Packet>& batch, std::vector<uint8_t>& blob);
+    // Transport control packets
     Omni::Fiber::Coroutine<void> SendPing(uint64_t timestamp_us);
     Omni::Fiber::Coroutine<void> SendFeedback(uint64_t echo_us);
-
-    // Decode helpers
-    struct RingSlot {
-        uint32_t group_seq = 0;
-        uint32_t source_count = 0;
-        uint32_t symbol_count = 0;
-        uint32_t max_esi = 0;
-        std::chrono::steady_clock::time_point first_time;
-
-        struct ShardEntry {
-            std::vector<uint8_t> data;
-            uint32_t esi;
-        };
-        std::vector<ShardEntry> shards;
-    };
-
-    std::vector<RingSlot> _RingBuffer;
-    size_t _RingNext = 0;
-    size_t _RingMask = 0;
-
-    RingSlot& FindSlot(uint32_t group_seq);
-    bool EvictStaleSlot();
 
     FecConfig _Cfg;
     bool _IsEncoder;
@@ -107,33 +49,9 @@ private:
     // Active loss pattern for testing (decode side)
     std::unique_ptr<LossPattern> _LossPattern;
 
-    // Encode state
+    // Transport state
     uint32_t _GroupSeq = 0;
     std::chrono::steady_clock::time_point _LastPingTime;
-
-    // RS encode state
-    uint32_t _RsSeq = 0;                      // source shard sequence (24-bit)
-    std::vector<Packet> _RsBatch;             // windowed source packets (copies)
-    uint32_t _RsBatchStartSeq = 0;
-    std::chrono::steady_clock::time_point _RsBatchStartTime;
-    bool _RsHaveBatch = false;
-
-    // RS decode state
-    std::map<uint32_t, std::vector<uint8_t>> _RsSrcs;  // received source shards (seq -> T-byte payload [len|data|pad])
-    std::map<uint32_t, std::vector<uint8_t>> _RsRepairs;  // batch id -> pending repairs (idx*T slots)
-    std::map<uint32_t, uint32_t> _RsBatchK;   // batch id -> k (window size)
-    std::map<uint32_t, std::chrono::steady_clock::time_point> _RsBatchTime;
-    uint32_t _RsDeliverSeq = 0;               // next seq to deliver (0 = unset)
-    bool _RsHaveWatermark = false;
-    std::chrono::steady_clock::time_point _RsLastFlushTime = std::chrono::steady_clock::now();
-
-    // Decode state
-    std::chrono::steady_clock::time_point _StartTime = std::chrono::steady_clock::now();
-    uint64_t _TotalPackets = 0;
-
-    // Accumulated loss statistics (decode success/failure ratio)
-    uint32_t _LossGroupCount = 0;
-    uint32_t _LossFailCount = 0;
 
     // Shared state between encoder and decoder (PING/FEEDBACK)
     std::shared_ptr<FecSharedState> _Shared;

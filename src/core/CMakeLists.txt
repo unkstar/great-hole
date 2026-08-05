@@ -20,8 +20,11 @@ foreach(suffix "" "-asan")
     EndpointUdp.cpp
     EndpointUdpMux.cpp
     EndpointUdpDynMux.cpp
+    FecCodec.cpp
     FecPipeline.cpp
+    LcrqCodec.cpp
     LossPattern.cpp
+    RsCodec.cpp
     RS256.cpp
     RaptorQ.cpp
   )

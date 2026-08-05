@@ -7,7 +7,7 @@ t = hole.tun("fec-test")
 
 local fec_cfg = {
     fec_codec = "rs",
-    timeout_ms = 1,
+    timeout_ms = 20,
     overhead = 0.01,
     max_overhead = 0.50,
     repeat_ratio = 4.0,
