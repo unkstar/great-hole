@@ -1105,3 +1105,26 @@ Google 测速下载 47.7 Mbps 即受限于 ER-X WireGuard 发送能力。上传 
 3. **-Og 与 -O3 无差异** (31.4 vs 34.2M) — 优化级别不是原因。
 4. **修正归因**: "batch 延迟"假说证伪 → "CPU 饱和"现象属实 → 根因 = **lcrq 小 K 编码吞吐 (无 AVX-512 时 ~30Mbps)**。REPEAT 快路径 (batch=1, UDP 53.4M) 绕过 RaptorQ 是当前唯一有效提速手段。
 5. **推论**: FEC 隧道吞吐上限 = min(链路, lcrq 小K编码吞吐)。换 AVX-512 实例或减少 RaptorQ 组 (ACK/小包 REPEAT 直发) 才能突破。
+
+## lcrq 瓶颈深挖 (2026-08-05) — 优化与 AVX-512 排除
+
+### 此前结论修正
+
+1. **"-O3 与 -Og 一致"是假象**: configure 的 CFLAGS 只写入顶层 Makefile，`make -C src` 子目录 make 不继承 → 两次测试实际都是 **-O0** 编译 (编译命令 `cc -fPIC -I.` 无 -O 标志确认)。用 `make CFLAGS='-O3 -march=native'` 真正重编后 K=17 仍 32.7M — **优化级别不是瓶颈**。
+2. **AVX-512 排除**: tokyo (AMD EPYC-Rome) 与 osaka (Xeon) 的 /proc/cpuinfo **均无 avx512 标志** (云 vCPU 未透传)，且两台机器 K=17 speedtest **实测一致 (31.4 vs 31.9 Mbps)** — 机器差异不是瓶颈。
+
+### 微基准定位 (tokyo, K=17, T=1440, 逐阶段计时)
+
+```
+rq_init     0.001 ms   (可忽略)
+rq_encode   5.0-11.3 ms  ← 占 99%，瓶颈所在
+rq_symbol ×18  0.06-0.10 ms (可忽略)
+```
+
+**rq_encode = RFC 6330 中间符号计算 (高斯消元 phase0-3 + 矩阵求解)**, 每批一次, O(L²·T) 字节运算, 数学必须开销。K=17 时约 5-11ms/组 → 编码上限 ~32Mbps。
+
+### 最终归因
+
+- FEC 隧道 UDP 27M = lcrq K≤200 编码上限 (~30M) − UDP I/O 开销, **集成无额外损失**。
+- 研究数据 (osaka 563M / ali 1769M, "K=32K symbols") 在两台机器当前构建下**不可复现** (K=1000 已崩至 8.9M, K=32K init >20min; K=17~200 全区间 ~30M) — 研究数据存疑。
+- **突破路径不变**: REPEAT 快路径 (batch=1 UDP 53.4M 已证) 或换 AVX-512 实例 (未验证, 云 vCPU 普遍不暴露 avx512)。
