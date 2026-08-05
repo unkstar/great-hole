@@ -123,6 +123,7 @@ private:
     std::map<uint32_t, std::chrono::steady_clock::time_point> _RsBatchTime;
     uint32_t _RsDeliverSeq = 0;               // next seq to deliver (0 = unset)
     bool _RsHaveWatermark = false;
+    std::chrono::steady_clock::time_point _RsLastFlushTime = std::chrono::steady_clock::now();
 
     // Decode state
     std::chrono::steady_clock::time_point _StartTime = std::chrono::steady_clock::now();
