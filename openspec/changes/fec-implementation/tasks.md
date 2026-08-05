@@ -112,6 +112,20 @@ Future optimization: implement "send-immediately + repair-later" (UDPspeeder Mod
 - [ ] 7.5 Document recommended algorithm + config for different link profiles
 - [ ] 7.6 24h+ stability soak test (no memory leaks, no ring buffer issues)
 
+## 9. Phase 9: RS Codec (Vandermonde GF256) — 可选 FEC 实现
+
+> 动机: tokyo vCPU 上 RaptorQ 27M vs RS 标量实测 280M (K=17)。RS 无中间符号消元, 且系统化源分片即收即发 (零 batch 延迟, TCP 友好)。lcrq 保留为默认。
+
+- [ ] 9.1 GF(256) 库: EXP/LOG 查表 + Vandermonde 系数构造 + fec_encode (逐 repair 生成) + fec_decode (k×k 高斯消元求逆) — 或引入 Rizzo fec.cpp (GPL-2.0 兼容)
+- [ ] 9.2 FecConfig 加 `fec_codec` 字段 ("lcrq" 默认 / "rs"), Lua 绑定
+- [ ] 9.3 RS 编码路径: systematic 源分片即发 + batch 窗口到期按 AdaptiveOverhead 补发 m 个 repair
+- [ ] 9.4 RS 解码路径: 序号缺口检测 + repair 收集 + k×k 高斯消元恢复 (无丢包零开销)
+- [ ] 9.5 wire format: repair 分片头 (batch_id 2B + repair_index 1B), 源分片复用 DWORD 头
+- [ ] 9.6 max_batch 约束: k+m ≤ 255 (GF256), 建议 max_batch ≤ 100 (冗余上限 155 = 37% 覆盖)
+- [ ] 9.7 矩阵测试: 8 算法 × 6 模式 × 4 速率跑 RS codec (复用 fec_matrix_test.py)
+- [ ] 9.8 隧道实测: ali↔tokyo fec-test 链路 TCP/UDP vs lcrq 对比 (预期 UDP ~90M / TCP 接近 nofec)
+- [ ] 9.9 spec 最终化: RS 实测数据回填 + 算法选型建议
+
 ## 8. Phase 8: Polish
 
 - [x] 8.0 修复 lcrq 构建集成缺陷: 丢失的 libs/lcrq/CMakeLists.txt 从 ali 部署副本找回, 正式化为 cmake/lcrq.cmake + cmake/lcrq-install.sh (BUILD_IN_SOURCE + ar 打包 + 头文件安装), 全新 clone 可复现构建 (2026-08-05)

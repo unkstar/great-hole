@@ -1179,3 +1179,58 @@ ali K=200: 183.1 Mbps。
 - **FEC 27M 瓶颈 = GGC tokyo vCPU 算力配额** (超售/节流), 与指令集、优化级别、batch 延迟、集成均无关。
 - **提速正路**: 换更高算力 vCPU (同 ali 算力即可 ~200M, 无需 AVX-512), 或减少 RaptorQ 使用 (REPEAT 快路径 53.4M)。
 - 客服邮件应诉求: CPU 配额/节点超售, 而非 AVX-512。
+
+## RS Codec 选项 (2026-08-05 新增) — Vandermonde GF(256) 在线模式
+
+> **动机**: tokyo vCPU 上 RaptorQ 仅 27M (中间符号高斯消元 5ms/组 是 CPU 大头)。
+> RS 无中间符号, 编码 = 纯 GF 线性组合。**tokyo 标量实测: K=17 时 280-287 Mbps** (RaptorQ 的 10 倍)。
+> 且 RS 系统化分片**源包即收即发** → 消除 batch 延迟 → TCP 接近 nofec。
+
+### 配置
+
+```lua
+fec_cfg = {
+    -- ...现有字段...
+    fec_codec = "rs",        -- "lcrq" (默认, RFC6330) | "rs" (Vandermonde GF256)
+}
+```
+
+### RS 设计 (在线动态补偿)
+
+**核心**: 系统化 Vandermonde RS, repair 分片独立生成 (fec_encode 生成 0..m 任意数量) → 冗余率实时可调, 等价 RaptorQ 的 rateless 在 0..(255-k) 区间。
+
+```
+编码端:
+  源包到达 → 立即发送 (systematic 分片, 零延迟)  ← TCP 友好关键
+           ↘ 攒 batch 窗口 (timeout_ms / max_batch)
+  窗口到期 → AdaptiveOverhead 计算 m (0..255-k)
+           → fec_encode 生成 m 个 repair (Vandermonde 行 × 源符号 GF 乘加)
+           → 补发 (带 batch_id + repair_index)
+
+解码端:
+  源分片 → 序号去重 → 直接交付 (无丢包零解码开销)
+  缺口检测 (batch 窗口内序号不连续) → 等 repair 分片
+          → fec_decode: 构造 k×k 子矩阵, GF(256) 高斯消元求逆 → 恢复缺失源分片
+```
+
+### 约束
+
+- GF(256) 域: k + m ≤ 255 (Vandermonde x 值互异) → max_batch ≤ 100 时冗余上限 155 (37% 覆盖); 单包 k=1 时上限 254
+- 解码 O(k³) GF 运算: 仅丢包时执行; k=17 时 ~5k 次运算 (微秒级); 建议 max_batch ≤ 100
+- wire format: repair 分片头含 batch_id (2B) + repair_index (1B); 源分片含 seq (现有 DWORD 头复用)
+- 与 lcrq 模式互斥 (fec_codec 二选一), 其余配置 (AdaptiveOverhead/LossPattern/测试矩阵) 全部复用
+
+### 实测基准 (tokyo, 标量, 正确性 OK)
+
+| K | m (repair 数) | 编码吞吐 |
+|:--:|:--:|:---:|
+| 17 | 1 | **280 Mbps** |
+| 17 | 5 | 287 Mbps |
+| 17 | 17 | 283 Mbps |
+| 200 | 10 | 22 Mbps (O(k·T), 大 K 受限) |
+
+### 预期隧道性能 (tokyo)
+
+- UDP: ~90M+ (UDPspeeder 同构实测 94.6M; 编码余量 3 倍)
+- TCP: 接近 nofec (源包零延迟, 生产嵌套 38.9M 为参考)
+- 对比 lcrq: UDP 27M → ~90M (3.3×); TCP 16M → ~35M+ (2.2×)
