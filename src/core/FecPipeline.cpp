@@ -486,7 +486,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::ProcessRsEncode() {
         // edge-triggered socket would hang if the buffer is not emptied.
         while (!_Stop.IsTriggered()) {
             Packet p2;
-            if (!_In->TryRead(p2)) break;
+            if (_In->TryRead(p2)) break;
             co_await RsHandleEncodePacket(std::move(p2));
         }
         (void)timeout;
@@ -613,7 +613,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::ProcessRsDecode() {
         // Drain the UDP endpoint (EPOLLET): same hang avoidance as encode side.
         while (!_Stop.IsTriggered()) {
             Packet p2;
-            if (!_In->TryRead(p2)) break;
+            if (_In->TryRead(p2)) break;
             co_await RsHandleDecodePacket(std::move(p2));
         }
     }
