@@ -2,7 +2,8 @@
 local test_port = 20086
 
 m = hole.udp_dyn_mux(test_port)
-c = m:create_channel("0123456789abcdef")
+-- active side: configured peer sends the first initiate; ali replies (passive)
+c = m:create_channel("0123456789abcdef", "39.108.136.48", test_port)
 t = hole.tun("fec-test")
 
 local fec_cfg = {
@@ -22,7 +23,7 @@ local fec_cfg = {
     feedback_stale_ms = 10000,
     ping_loss_threshold = 5,
     decode_timeout_ms = 200,
-    algo = 3,
+    algo = 0,
     safety_margin = 0.01,
     loss_window_groups = 50,
     loss_alpha = 0.1,
