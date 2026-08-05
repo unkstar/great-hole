@@ -503,6 +503,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::RsHandleEncodePacket(Packet&& p) {
     const uint32_t T = rs_symbol_size(_Cfg);
     const auto timeout = std::chrono::milliseconds(_Cfg.timeout_ms);
     const size_t dlen = p.DataSize();
+    BOOST_LOG_TRIVIAL(info) << "RS-ENC in=" << dlen;
     if (dlen == 0) co_return;
     const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
     const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
@@ -616,6 +617,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::ProcessRsDecode() {
 
 Omni::Fiber::Coroutine<void> FecPipeline::RsHandleDecodePacket(Packet&& p) {
     const uint32_t T = rs_symbol_size(_Cfg);
+    BOOST_LOG_TRIVIAL(info) << "RS-DEC in=" << p.DataSize();
     if (p.DataSize() < 5) co_return;
     const uint32_t dw = p.PopFrontLE<uint32_t>();
     const uint32_t seq = dw & 0xFFFFFF;
