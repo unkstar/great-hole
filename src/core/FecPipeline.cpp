@@ -18,6 +18,7 @@
 #include "LossPattern.hpp"
 #include "Packet.hpp"
 #include "RaptorQ.hpp"
+#include "RS256.hpp"
 
 namespace gh {
 
@@ -59,6 +60,14 @@ uint32_t FecPipeline::BuildDword(uint32_t group_seq, uint8_t flags) const {
 }
 
 Omni::Fiber::Coroutine<void> FecPipeline::Process() {
+    if (_Cfg.fec_codec == "rs") {
+        if (_IsEncoder) {
+            co_await ProcessRsEncode();
+        } else {
+            co_await ProcessRsDecode();
+        }
+        co_return;
+    }
     auto& fiber = co_await Omni::Fiber::GetCurrentFiber();
 
     if (_IsEncoder) {
@@ -431,6 +440,306 @@ bool FecPipeline::EvictStaleSlot() {
         }
     }
     return false;
+}
+
+// ============================ RS CODEC (Vandermonde GF256) ============================
+
+static uint32_t rs_symbol_size(const FecConfig& cfg) {
+    uint32_t T = cfg.symbol_size;
+    if (T == 0) { T = cfg.mtu - 28 - 20; if (T < 64) T = 64; }
+    return T;
+}
+
+Omni::Fiber::Coroutine<void> FecPipeline::ProcessRsEncode() {
+    const uint32_t T = rs_symbol_size(_Cfg);
+    const auto timeout = std::chrono::milliseconds(_Cfg.timeout_ms);
+
+    while (!_Stop.IsTriggered()) {
+        // PING/FEEDBACK — same scheduling as the lcrq path
+        if (_Shared) {
+            if (_Cfg.ping_interval_ms > 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - _LastPingTime).count();
+                if (_LastPingTime.time_since_epoch().count() == 0 || elapsed >= _Cfg.ping_interval_ms) {
+                    _LastPingTime = now;
+                    auto now_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count());
+                    co_await SendPing(now_us);
+                }
+            }
+            if (_Shared->pending_feedback_echo != 0) {
+                uint64_t echo = _Shared->pending_feedback_echo;
+                _Shared->pending_feedback_echo = 0;
+                co_await SendFeedback(echo);
+            }
+        }
+
+        Packet p;
+        auto err = co_await _In->Read(p, _Stop);
+        if (err) {
+            if (err == ErrorCode{AppErrorCategory::kOperationAborted, kAppError}) continue;
+            if (err == ErrorCode{AppErrorCategory::kEndOfStream, kAppError}) break;
+            if (IsCritical(err)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") RS read error: " << err.message(); throw SystemError(err, "FecPipeline RS read error"); }
+            BOOST_LOG_TRIVIAL(warning) << "FecPipeline(" << this << ") RS read warning: " << err.message(); continue;
+        }
+        const size_t dlen = p.DataSize();
+        if (dlen == 0) continue;
+        const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
+        const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
+
+        // small packets (<256B payload) or oversized: direct send, no RS protection
+        if (dlen + 2 > T || dlen < 256) {
+            Packet out; out._Length = 0;
+            out.PushBack(p.Data());
+            out.PushFrontLE(static_cast<uint16_t>(dlen));
+            out.PushFrontLE(fb);
+            out.PushFrontLE(BuildDword(++_RsSeq, kRsSmall));
+            auto werr = co_await _Out->Write(out, _Stop);
+            if (werr && IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") RS write error: " << werr.message(); throw SystemError(werr, "FecPipeline RS write error"); }
+            continue;
+        }
+
+        // RS source shard: send immediately (zero batch delay), accumulate copy for repair
+        uint32_t seq = (++_RsSeq) & 0xFFFFFF;
+        if (seq == 0) seq = 1;
+        {
+            Packet out; out._Length = 0;
+            out.PushBack(p.Data());
+            out.PushFrontLE(static_cast<uint16_t>(dlen));
+            out.PushFrontLE(fb);
+            out.PushFrontLE(BuildDword(seq, 0));
+            const size_t pad = T - out.DataSize();
+            if (pad > 0) {
+                out._Data.resize(out._Offset + out._Length + pad);
+                std::memset(out._Data.data() + out._Offset + out._Length, 0, pad);
+                out._Length += pad;
+            }
+            auto werr = co_await _Out->Write(out, _Stop);
+            if (werr && IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") RS write error: " << werr.message(); throw SystemError(werr, "FecPipeline RS write error"); }
+        }
+
+        // batch window bookkeeping
+        const auto now = std::chrono::steady_clock::now();
+        if (!_RsHaveBatch) {
+            _RsHaveBatch = true;
+            _RsBatchStartSeq = seq;
+            _RsBatchStartTime = now;
+        }
+        _RsBatch.push_back(std::move(p));
+        const bool full = _RsBatch.size() >= _Cfg.max_batch;
+        const bool timed_out = (now - _RsBatchStartTime) >= timeout;
+        if (full || timed_out) {
+            co_await SendRsRepair(_RsBatch, _RsBatchStartSeq);
+            _RsBatch.clear();
+            _RsHaveBatch = false;
+        }
+    }
+    if (_RsHaveBatch && !_RsBatch.empty()) {
+        co_await SendRsRepair(_RsBatch, _RsBatchStartSeq);
+        _RsBatch.clear();
+        _RsHaveBatch = false;
+    }
+    co_return;
+}
+
+Omni::Fiber::Coroutine<void> FecPipeline::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq) {
+    const uint32_t k = static_cast<uint32_t>(batch.size());
+    if (k == 0) co_return;
+    const uint32_t T = rs_symbol_size(_Cfg);
+    float oh = _OverheadCtrl ? _OverheadCtrl->GetOverhead() : _Cfg.overhead;
+    if (_OverheadCtrl && _Shared) _OverheadCtrl->Update(_Shared->latest_loss_rate);
+    uint32_t m = static_cast<uint32_t>(std::ceil(k * oh));
+    if (m > 255 - k) m = 255 - k;
+    if (m == 0) co_return;
+
+    std::vector<std::vector<uint8_t>> srcv(k, std::vector<uint8_t>(T, 0));
+    for (uint32_t i = 0; i < k; i++) {
+        auto d = batch[i].Data();
+        std::memcpy(srcv[i].data(), d.data(), std::min<size_t>(d.size(), T));
+    }
+    std::vector<std::vector<uint8_t>> repairs;
+    RS256::EncodeRepair(srcv, T, RS256::BuildCoeffs(k, m), repairs);
+
+    const uint16_t bid = static_cast<uint16_t>(batch_start_seq & 0xFFFF);
+    const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
+    const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
+    for (uint32_t j = 0; j < m; j++) {
+        Packet out; out._Length = 0;
+        out.PushBack(std::span<const uint8_t>(repairs[j].data(), T));
+        out.PushFrontLE(static_cast<uint8_t>(j));
+        out.PushFrontLE(static_cast<uint8_t>(k));
+        out.PushFrontLE(bid);
+        out.PushFrontLE(fb);
+        out.PushFrontLE(BuildDword(bid, kRsRepair));
+        auto werr = co_await _Out->Write(out, _Stop);
+        if (werr && IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") RS repair write error: " << werr.message(); throw SystemError(werr, "FecPipeline RS repair write error"); }
+    }
+    BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this << ") RS batch k=" << k << " repairs=" << m;
+    co_return;
+}
+
+Omni::Fiber::Coroutine<void> FecPipeline::ProcessRsDecode() {
+    const uint32_t T = rs_symbol_size(_Cfg);
+
+    while (!_Stop.IsTriggered()) {
+        Packet p;
+        auto err = co_await _In->Read(p, _Stop);
+        if (err) {
+            if (err == ErrorCode{AppErrorCategory::kOperationAborted, kAppError}) continue;
+            if (err == ErrorCode{AppErrorCategory::kEndOfStream, kAppError}) break;
+            if (IsCritical(err)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") RS decode read error: " << err.message(); throw SystemError(err, "FecPipeline RS decode read error"); }
+            BOOST_LOG_TRIVIAL(warning) << "FecPipeline(" << this << ") RS decode read warning: " << err.message(); continue;
+        }
+        if (p.DataSize() < 5) continue;
+        const uint32_t dw = p.PopFrontLE<uint32_t>();
+        const uint32_t seq = dw & 0xFFFFFF;
+        const uint8_t f = (dw >> 24) & 0xFF;
+
+        const bool is_control = (f & kPing) || (f & kFeedback);
+        if (!is_control && _LossPattern) {
+            auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - _StartTime).count();
+            if (_LossPattern->ShouldDrop(_TotalPackets, elapsed)) { _TotalPackets++; continue; }
+        }
+        _TotalPackets++;
+        const uint8_t fb = p.PopFrontLE<uint8_t>();
+        if (_Shared && fb <= 250) { _Shared->latest_loss_rate = static_cast<float>(fb) / 250.0f; }
+        bool has_echo = (f & kEcho) != 0;
+        if (has_echo) { if (p.DataSize() < 8) continue; uint64_t echo = p.PopFrontLE<uint64_t>(); if (f & kFeedback && _Shared) { auto now_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); uint64_t rtt_us = (now_us > echo) ? (now_us - echo) : 0; if (rtt_us > 0) { _Shared->rtt_ewma_us = (_Shared->rtt_ewma_us == 0) ? rtt_us : (_Shared->rtt_ewma_us * 7 + rtt_us) / 8; } } }
+        if (f & kPing) {
+            if (p.DataSize() >= 8 && _Shared) { _Shared->pending_feedback_echo = p.PopFrontLE<uint64_t>(); }
+            continue;
+        }
+        if (f & kFeedback) continue;
+
+        if (f & kRsRepair) {
+            if (p.DataSize() < 4) continue;
+            const uint16_t bid = p.PopFrontLE<uint16_t>();
+            const uint8_t k = p.PopFrontLE<uint8_t>();
+            const uint8_t idx = p.PopFrontLE<uint8_t>();
+            if (p.DataSize() < T) continue;
+            auto& rep = _RsRepairs[bid];
+            const size_t off = static_cast<size_t>(idx) * T;
+            if (rep.size() < off + T) rep.resize(off + T);
+            std::memcpy(rep.data() + off, p.Data().data(), T);
+            _RsBatchK[bid] = k;
+            _RsBatchTime[bid] = std::chrono::steady_clock::now();
+            RsTryRecover(bid, k);
+            co_await RsFlushDelivery();
+            continue;
+        }
+
+        // source shard (RS protected or small direct)
+        if (p.DataSize() < 2) continue;
+        const uint16_t len = p.PopFrontLE<uint16_t>();
+        if (len > p.DataSize()) continue;
+        if (f & kRsSmall) {
+            Packet out; out._Length = 0;
+            out.PushBack(std::span<const uint8_t>(p.Data().data(), len));
+            auto werr = co_await _Out->Write(out, _Stop);
+            if (werr && IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") RS write error: " << werr.message(); throw SystemError(werr, "FecPipeline RS write error"); }
+            continue;
+        }
+        // RS source shard: cache padded payload, deliver in seq order
+        std::vector<uint8_t> payload(T, 0);
+        payload[0] = static_cast<uint8_t>(len & 0xFF);
+        payload[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
+        std::memcpy(payload.data() + 2, p.Data().data(), std::min<size_t>(len, p.DataSize()));
+        _RsSrcs[seq] = std::move(payload);
+        if (!_RsHaveWatermark) { _RsHaveWatermark = true; _RsDeliverSeq = seq - 1; }
+        co_await RsFlushDelivery();
+
+        // stale batch cleanup: force watermark past batches that can no longer recover
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = _RsBatchTime.begin(); it != _RsBatchTime.end();) {
+            if (now - it->second > std::chrono::milliseconds(_Cfg.decode_timeout_ms)) {
+                const uint32_t k = _RsBatchK.count(it->first) ? _RsBatchK[it->first] : 0;
+                const uint32_t end = static_cast<uint32_t>(it->first) + k;
+                while (_RsHaveWatermark && _RsDeliverSeq + 1 < end && !_RsSrcs.count(_RsDeliverSeq + 1)) {
+                    _RsDeliverSeq++;
+                }
+                _RsRepairs.erase(it->first);
+                _RsBatchK.erase(it->first);
+                it = _RsBatchTime.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        co_await RsFlushDelivery();
+    }
+    co_return;
+}
+
+Omni::Fiber::Coroutine<void> FecPipeline::RsFlushDelivery() {
+    while (_RsHaveWatermark) {
+        const uint32_t next = _RsDeliverSeq + 1;
+        auto it = _RsSrcs.find(next);
+        if (it == _RsSrcs.end()) break;
+        const auto& payload = it->second;
+        const uint16_t len = static_cast<uint16_t>(payload[0]) | (static_cast<uint16_t>(payload[1]) << 8);
+        if (payload.size() < 2 + len) { _RsSrcs.erase(it); _RsDeliverSeq++; continue; }
+        Packet out; out._Length = 0;
+        out.PushBack(std::span<const uint8_t>(payload.data() + 2, len));
+        _RsSrcs.erase(it);
+        _RsDeliverSeq++;
+        auto werr = co_await _Out->Write(out, _Stop);
+        if (werr && IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") RS write error: " << werr.message(); throw SystemError(werr, "FecPipeline RS write error"); }
+    }
+    co_return;
+}
+
+void FecPipeline::RsTryRecover(uint32_t bid, uint32_t k) {
+    const uint32_t T = rs_symbol_size(_Cfg);
+    auto rep_it = _RsRepairs.find(bid);
+    if (rep_it == _RsRepairs.end()) return;
+    if (k == 0 || k > 255) return;
+
+    // missing source shards in [bid, bid+k)
+    std::vector<uint32_t> missing;
+    for (uint32_t s = bid; s < bid + k; s++) {
+        if (!_RsSrcs.count(s)) missing.push_back(s);
+    }
+    if (missing.empty()) {
+        _RsRepairs.erase(rep_it);
+        _RsBatchK.erase(bid);
+        _RsBatchTime.erase(bid);
+        return;
+    }
+    const size_t repairs_available = rep_it->second.size() / T;
+    if (missing.size() > repairs_available) return;  // wait for more repairs
+
+    // assemble known shards: source unit rows + repair Vandermonde rows
+    std::vector<std::vector<uint8_t>> known, rows;
+    for (uint32_t s = bid; s < bid + k; s++) {
+        auto sit = _RsSrcs.find(s);
+        if (sit == _RsSrcs.end()) continue;
+        std::vector<uint8_t> row(k, 0);
+        row[s - bid] = 1;
+        known.push_back(sit->second);
+        rows.push_back(std::move(row));
+    }
+    const uint8_t* rep_data = rep_it->second.data();
+    for (uint32_t j = 0; j < k && known.size() < k; j++) {
+        const size_t off = static_cast<size_t>(j) * T;
+        if (off + T > rep_it->second.size()) break;
+        known.push_back(std::vector<uint8_t>(rep_data + off, rep_data + off + T));
+        rows.push_back(RS256::RepairRow(k, j));
+    }
+    if (known.size() < k) return;
+
+    std::vector<std::vector<uint8_t>> out_src;
+    if (!RS256::Decode(known, T, rows, out_src)) {
+        BOOST_LOG_TRIVIAL(warning) << "FecPipeline(" << this << ") RS recover failed for batch " << bid;
+        _RsRepairs.erase(rep_it);
+        _RsBatchK.erase(bid);
+        _RsBatchTime.erase(bid);
+        return;
+    }
+    BOOST_LOG_TRIVIAL(info) << "FecPipeline(" << this << ") RS recovered " << missing.size() << " shards in batch " << bid;
+    for (uint32_t s : missing) {
+        _RsSrcs[s] = std::move(out_src[s - bid]);
+    }
+    _RsRepairs.erase(rep_it);
+    _RsBatchK.erase(bid);
+    _RsBatchTime.erase(bid);
 }
 
 } // namespace gh

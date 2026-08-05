@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -50,9 +51,22 @@ private:
         kRepeat = 1 << 6,
         kEcho = 1 << 7,
     };
+    // RS codec flags (fec_codec="rs"): bit3 = direct small packet (no RS),
+    // bit6 reused as RS repair shard marker (kRepeat never set in RS mode).
+    enum RsFlags : uint8_t {
+        kRsSmall = 1 << 3,
+        kRsRepair = 1 << 6,
+    };
 
     uint8_t BuildFlags() const;
     uint32_t BuildDword(uint32_t group_seq, uint8_t flags) const;
+
+    // === RS codec (Vandermonde GF256) ===
+    Omni::Fiber::Coroutine<void> ProcessRsEncode();
+    Omni::Fiber::Coroutine<void> ProcessRsDecode();
+    Omni::Fiber::Coroutine<void> SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq);
+    Omni::Fiber::Coroutine<void> RsFlushDelivery();
+    void RsTryRecover(uint32_t bid, uint32_t k);
 
     // Encode helpers
     Omni::Fiber::Coroutine<void> SendBatch(std::vector<Packet>& batch);
@@ -94,6 +108,21 @@ private:
     // Encode state
     uint32_t _GroupSeq = 0;
     std::chrono::steady_clock::time_point _LastPingTime;
+
+    // RS encode state
+    uint32_t _RsSeq = 0;                      // source shard sequence (24-bit)
+    std::vector<Packet> _RsBatch;             // windowed source packets (copies)
+    uint32_t _RsBatchStartSeq = 0;
+    std::chrono::steady_clock::time_point _RsBatchStartTime;
+    bool _RsHaveBatch = false;
+
+    // RS decode state
+    std::map<uint32_t, std::vector<uint8_t>> _RsSrcs;  // received source shards (seq -> T-byte payload [len|data|pad])
+    std::map<uint32_t, std::vector<uint8_t>> _RsRepairs;  // batch id -> pending repairs (idx*T slots)
+    std::map<uint32_t, uint32_t> _RsBatchK;   // batch id -> k (window size)
+    std::map<uint32_t, std::chrono::steady_clock::time_point> _RsBatchTime;
+    uint32_t _RsDeliverSeq = 0;               // next seq to deliver (0 = unset)
+    bool _RsHaveWatermark = false;
 
     // Decode state
     std::chrono::steady_clock::time_point _StartTime = std::chrono::steady_clock::now();

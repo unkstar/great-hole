@@ -197,6 +197,9 @@ static void fec_pipeline_new(lua_State* L) {
   FecConfig cfg;
   bool is_encoder = true;
   if (c >= 4 && lua_istable(L, 4)) {
+    lua_getfield(L, 4, "fec_codec");
+    if (lua_isstring(L, -1)) cfg.fec_codec = lua_tostring(L, -1);
+    lua_pop(L, 1);
     lua_getfield(L, 4, "timeout_ms");
     if (lua_isinteger(L, -1)) cfg.timeout_ms = (uint32_t)lua_tointeger(L, -1);
     lua_pop(L, 1);
