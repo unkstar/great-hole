@@ -114,6 +114,7 @@ Future optimization: implement "send-immediately + repair-later" (UDPspeeder Mod
 
 ## 8. Phase 8: Polish
 
+- [x] 8.0 修复 lcrq 构建集成缺陷: 丢失的 libs/lcrq/CMakeLists.txt 从 ali 部署副本找回, 正式化为 cmake/lcrq.cmake + cmake/lcrq-install.sh (BUILD_IN_SOURCE + ar 打包 + 头文件安装), 全新 clone 可复现构建 (2026-08-05)
 - [ ] 8.1 Add FEC-specific metrics/logging (overhead history, RTT EWMA, decode success rate)
 - [ ] 8.2 Evaluate removing any algorithms that consistently underperform
 - [ ] 8.3 Update `openspec/specs/fec-spec.md` with final decisions from test results
