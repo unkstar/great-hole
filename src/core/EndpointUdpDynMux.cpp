@@ -257,8 +257,15 @@ UdpDynMux::Channel::HandleControlPacket(boost::asio::ip::udp::endpoint peer, Pac
       }
 
       if (!myRxMatches) {
+        // Keep negotiating: reply and stay in the negotiating loop. Without
+        // this, a passive side (no peer resolver) that receives an initiate
+        // with a stale PeerRxId replies once and then returns kRunning, while
+        // the active peer (its my-rx matched) never re-initiates — the passive
+        // side would wait forever in negotiating. Returning kNegotiating lets
+        // both sides exchange initiates until PeerRxId converges.
         BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (my rx mismatch) sending initiate to " << peer;
         co_await _Parent.SendControlInitiate(peer, init->Psk, _LocalRxId, _RemoteRxId);
+        co_return State::kNegotiating;
       }
 
       co_return State::kRunning;
