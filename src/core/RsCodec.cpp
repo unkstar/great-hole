@@ -65,15 +65,27 @@ void RsCodec::EncodePacket(Packet&& p, std::vector<Packet>& out) {
     const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
     const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
 
-    // small packets (<256B payload) or oversized: direct send, no RS protection.
-    // seq=0: small shards do NOT consume RS sequence space (RS batch seqs stay contiguous).
+    // small packets (<256B payload) or oversized: direct send with redundancy
+    // (like the lcrq REPEAT path). seq=0: small shards do NOT consume RS
+    // sequence space (RS batch seqs stay contiguous).
     if (dlen + 2 > T || dlen < 256) {
-        Packet op; op._Length = 0;
-        op.PushBack(p.Data());
-        op.PushFrontLE(static_cast<uint16_t>(dlen));
-        op.PushFrontLE(fb);
-        op.PushFrontLE(BuildDword(0, kRsSmall));
-        out.push_back(std::move(op));
+        // redundancy copies: 1 + ceil(repeat_ratio), adapted like lcrq
+        float adaptive_ratio = _Cfg.repeat_ratio;
+        if (_OverheadCtrl) {
+            float oh = _OverheadCtrl->GetOverhead();
+            float frac = (oh - _Cfg.safety_margin) / (_Cfg.max_overhead - _Cfg.safety_margin);
+            frac = std::clamp(frac, 0.0f, 1.0f);
+            adaptive_ratio = _Cfg.repeat_ratio_min + (_Cfg.repeat_ratio_max - _Cfg.repeat_ratio_min) * frac;
+        }
+        uint32_t copies = static_cast<uint32_t>(std::ceil(adaptive_ratio)) + 1;
+        for (uint32_t i = 0; i < copies; i++) {
+            Packet op; op._Length = 0;
+            op.PushBack(p.Data());
+            op.PushFrontLE(static_cast<uint16_t>(dlen));
+            op.PushFrontLE(fb);
+            op.PushFrontLE(BuildDword(0, kRsSmall));
+            out.push_back(std::move(op));
+        }
         return;
     }
 
@@ -131,7 +143,9 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
     std::vector<std::vector<uint8_t>> repairs;
     RS256::EncodeRepair(srcv, T, RS256::BuildCoeffs(k, m), repairs);
 
-    const uint16_t bid = static_cast<uint16_t>(batch_start_seq & 0xFFFF);
+    // full 24-bit batch start seq on the wire: a 16-bit truncation would
+    // break repair recovery once seq > 65535 (~94MB of traffic)
+    const uint32_t bid = batch_start_seq & 0xFFFFFF;
     const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
     const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
     for (uint32_t j = 0; j < m; j++) {
@@ -139,7 +153,8 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
         op.PushBack(std::span<const uint8_t>(repairs[j].data(), T));
         op.PushFrontLE(static_cast<uint8_t>(j));
         op.PushFrontLE(static_cast<uint8_t>(k));
-        op.PushFrontLE(bid);
+        op.PushFrontLE(static_cast<uint16_t>(bid & 0xFFFF));
+        op.PushFrontLE(static_cast<uint8_t>((bid >> 16) & 0xFF));
         op.PushFrontLE(fb);
         op.PushFrontLE(BuildDword(bid, kRsRepair));
         out.push_back(std::move(op));
@@ -178,8 +193,8 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     if (f & kFeedback) return;
 
     if (f & kRsRepair) {
-        if (p.DataSize() < 4) return;
-        const uint16_t bid = p.PopFrontLE<uint16_t>();
+        if (p.DataSize() < 5) return;
+        const uint32_t bid = (p.PopFrontLE<uint16_t>() | (static_cast<uint32_t>(p.PopFrontLE<uint8_t>()) << 16)) & 0xFFFFFF;
         const uint8_t k = p.PopFrontLE<uint8_t>();
         const uint8_t idx = p.PopFrontLE<uint8_t>();
         if (p.DataSize() < T) return;
@@ -200,8 +215,20 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     const uint16_t len = p.PopFrontLE<uint16_t>();
     if (len > p.DataSize()) return;
     if (f & kRsSmall) {
+        // dedup: redundancy copies of the same small packet (identical
+        // payload, back-to-back) must be delivered once, like the lcrq
+        // REPEAT seen check. Duplicate delivery would flood TCP with
+        // duplicate ACKs (cwnd collapse) and skew UDP datagram counts.
+        const auto* d = p.Data().data();
+        if (_HaveLastSmall && _LastSmall.size() == len &&
+            std::memcmp(_LastSmall.data(), d, len) == 0) {
+            return;
+        }
+        _HaveLastSmall = true;
+        if (_LastSmall.size() != len) _LastSmall.resize(len);
+        std::memcpy(_LastSmall.data(), d, len);
         Packet op; op._Length = 0;
-        op.PushBack(std::span<const uint8_t>(p.Data().data(), len));
+        op.PushBack(std::span<const uint8_t>(d, len));
         out.push_back(std::move(op));
         return;
     }
@@ -226,10 +253,16 @@ void RsCodec::AdvanceWatermark(const std::chrono::steady_clock::time_point& now,
     if (!_RsHaveWatermark || now - _RsLastFlushTime <= std::chrono::milliseconds(_Cfg.decode_timeout_ms)) {
         return;
     }
+    // find the smallest valid cached seq at/after the watermark. Ring scan
+    // must track the MINIMUM seq, not the first valid slot in slot order —
+    // slot order is arbitrary (seq & mask), so the first hit can be far
+    // ahead, skipping (and losing) all shards in between.
     uint32_t gap_seq = 0;
     for (uint32_t i = 0; i < kRsSrcSlots; i++) {
         const auto& s = _RsSrcs[i];
-        if (s.valid && s.seq >= _RsDeliverSeq + 1) { gap_seq = s.seq; break; }
+        if (s.valid && s.seq >= _RsDeliverSeq + 1 && (gap_seq == 0 || s.seq < gap_seq)) {
+            gap_seq = s.seq;
+        }
     }
     if (gap_seq > _RsDeliverSeq + 1) {
         const uint32_t skipped = gap_seq - 1 - _RsDeliverSeq;
