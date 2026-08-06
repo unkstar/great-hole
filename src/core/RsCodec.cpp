@@ -55,8 +55,27 @@ void RsCodec::Tick(std::vector<Packet>& out) {
             _RsHaveBatch = false;
         }
     } else {
+        UpdateLossRate();
         AdvanceWatermark(now, out);
     }
+}
+
+void RsCodec::UpdateLossRate() {
+    // Batch-granularity fail rate, mirrors lcrq: update once per
+    // loss_window_groups completed batches, IIR-smoothed into the shared
+    // loss rate (which the local encoder reads, and which the fb byte
+    // carries to the peer encoder for the opposite direction).
+    if (!_Shared) return;
+    const uint32_t window = _Cfg.loss_window_groups > 0 ? _Cfg.loss_window_groups : 50;
+    if (_RsLossGroups < window) return;
+    const float fail_rate = static_cast<float>(_RsLossFails) / static_cast<float>(_RsLossGroups);
+    const float alpha = _Cfg.loss_alpha > 0 ? _Cfg.loss_alpha : 0.1f;
+    _Shared->latest_loss_rate = alpha * fail_rate + (1.0f - alpha) * _Shared->latest_loss_rate;
+    BOOST_LOG_TRIVIAL(debug) << "RsLossRate: fails=" << _RsLossFails << "/" << _RsLossGroups
+                             << " fail_rate=" << fail_rate
+                             << " -> rate=" << _Shared->latest_loss_rate;
+    _RsLossGroups = 0;
+    _RsLossFails = 0;
 }
 
 void RsCodec::EncodePacket(Packet&& p, std::vector<Packet>& out) {
@@ -150,28 +169,21 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
     const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
     const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
     for (uint32_t j = 0; j < m; j++) {
-        // Send each repair twice: repairs ride the same lossy line as the
-        // shards (~1.6% here), and one lost repair silently kills recovery
-        // for its batch (missing > available, no retry). The decoder is
-        // idempotent on duplicate repairs (same idx overwrites, mask bit
-        // already set), so no decoder change is needed.
-        for (uint32_t dup = 0; dup < 2; dup++) {
-            Packet op; op._Length = 0;
-            op.PushBack(std::span<const uint8_t>(repairs[j].data(), T));
-            op.PushFrontLE(static_cast<uint8_t>(j));
-            op.PushFrontLE(static_cast<uint8_t>(k));
-            // Wire bytes are [lo16 | hi] = standard 24-bit LE. PushFrontLE
-            // prepends, so push the HIGH byte first, then the low 16 bits.
-            // (bbf1455 pushed low-16 first: wire became [hi lo0 lo1], the
-            // decoder rebuilt hi + (lo0<<8) + (lo1<<16) — a scrambled batch id
-            // on every packet, so repairs keyed to the wrong batch and
-            // recovery NEVER triggered.)
-            op.PushFrontLE(static_cast<uint8_t>((bid >> 16) & 0xFF));
-            op.PushFrontLE(static_cast<uint16_t>(bid & 0xFFFF));
-            op.PushFrontLE(fb);
-            op.PushFrontLE(BuildDword(bid, kRsRepair));
-            out.push_back(std::move(op));
-        }
+        Packet op; op._Length = 0;
+        op.PushBack(std::span<const uint8_t>(repairs[j].data(), T));
+        op.PushFrontLE(static_cast<uint8_t>(j));
+        op.PushFrontLE(static_cast<uint8_t>(k));
+        // Wire bytes are [lo16 | hi] = standard 24-bit LE. PushFrontLE
+        // prepends, so push the HIGH byte first, then the low 16 bits.
+        // (bbf1455 pushed low-16 first: wire became [hi lo0 lo1], the
+        // decoder rebuilt hi + (lo0<<8) + (lo1<<16) — a scrambled batch id
+        // on every packet, so repairs keyed to the wrong batch and
+        // recovery NEVER triggered.)
+        op.PushFrontLE(static_cast<uint8_t>((bid >> 16) & 0xFF));
+        op.PushFrontLE(static_cast<uint16_t>(bid & 0xFFFF));
+        op.PushFrontLE(fb);
+        op.PushFrontLE(BuildDword(bid, kRsRepair));
+        out.push_back(std::move(op));
     }
 }
 
@@ -214,7 +226,8 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
         if (p.DataSize() < T) return;
         auto& rep = _RsRepairs[bid & (kRsRepairSlots - 1)];
         if (!rep.valid || rep.bid != bid) {
-            rep.bid = bid; rep.k = k; rep.valid = true; rep.data.clear(); rep.mask.fill(0);
+            rep.bid = bid; rep.k = k; rep.valid = true; rep.completed = false;
+            rep.data.clear(); rep.mask.fill(0);
         }
         const size_t off = static_cast<size_t>(idx) * T;
         if (rep.data.size() < off + T) rep.data.resize(off + T);
@@ -296,6 +309,20 @@ void RsCodec::AdvanceWatermark(const std::chrono::steady_clock::time_point& now,
         const uint32_t skipped = gap_seq - 1 - _RsDeliverSeq;
         _RsDeliverSeq = gap_seq - 1;
         BOOST_LOG_TRIVIAL(warning) << "RsCodec watermark stall: skipped " << skipped << " missing shards";
+        // Skipped shards are confirmed loss: mark every repair slot whose
+        // batch overlaps the skipped range as failed (counted once). The
+        // cleanup path cannot detect these — the guard already advanced the
+        // watermark past them.
+        const uint32_t a = _RsDeliverSeq + 1;
+        const uint32_t b = gap_seq;
+        for (uint32_t i = 0; i < kRsRepairSlots; i++) {
+            auto& r = _RsRepairs[i];
+            if (!r.valid || r.completed) continue;
+            if (r.bid < b && a < static_cast<uint32_t>(r.bid) + r.k) {
+                _RsLossFails++;
+                r.completed = true;
+            }
+        }
     }
     _RsLastFlushTime = now;
 
@@ -306,11 +333,17 @@ void RsCodec::AdvanceWatermark(const std::chrono::steady_clock::time_point& now,
         if (!r.valid) continue;
         if (now - r.time > std::chrono::milliseconds(_Cfg.decode_timeout_ms)) {
             const uint32_t end = static_cast<uint32_t>(r.bid) + r.k;
+            bool had_gap = false;
             while (_RsHaveWatermark && _RsDeliverSeq + 1 < end) {
                 const auto& s = _RsSrcs[(_RsDeliverSeq + 1) & (kRsSrcSlots - 1)];
                 if (s.valid && s.seq == _RsDeliverSeq + 1) break;
                 _RsDeliverSeq++;
+                had_gap = true;
             }
+            // batch completed (slot released): recovered/no-gap → ok;
+            // expired with unrecovered gaps and never completed → fail
+            _RsLossGroups++;
+            if (!r.completed && had_gap) _RsLossFails++;
             r.valid = false;
             r.data.clear();
         }
@@ -348,8 +381,7 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k) {
         if (!(slot.valid && slot.seq == s)) missing.push_back(s);
     }
     if (missing.empty()) {
-        rep.valid = false;
-        rep.data.clear();
+        rep.completed = true;  // no gaps → ok (counted at slot release)
         return;
     }
     // count only repairs actually received: an unarrived repair in the
@@ -382,9 +414,7 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k) {
     std::vector<std::vector<uint8_t>> out_src;
     if (!RS256::Decode(known, T, rows, out_src)) {
         BOOST_LOG_TRIVIAL(warning) << "RsCodec recover failed for batch " << bid;
-        rep.valid = false;
-        rep.data.clear();
-        return;
+        return;  // keep slot: later shard arrivals retry; outcome counted at release
     }
     BOOST_LOG_TRIVIAL(info) << "RsCodec recovered " << missing.size() << " shards in batch " << bid;
     for (uint32_t s : missing) {
@@ -393,8 +423,7 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k) {
         slot.valid = true;
         slot.payload = std::move(out_src[s - bid]);
     }
-    rep.valid = false;
-    rep.data.clear();
+    rep.completed = true;  // batch fully recovered → ok (counted at slot release)
 }
 
 } // namespace gh

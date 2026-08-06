@@ -45,6 +45,7 @@ private:
         uint32_t bid = 0;  // full 24-bit batch start seq
         uint8_t k = 0;
         bool valid = false;
+        bool completed = false;  // batch outcome already counted in loss stats
         std::chrono::steady_clock::time_point time;
         std::vector<uint8_t> data;  // idx*T slots, capacity reused
         std::array<uint8_t, 32> mask{};  // received repair idx bits (m <= 254)
@@ -71,6 +72,18 @@ private:
     uint32_t _RsDeliverSeq = 0;
     bool _RsHaveWatermark = false;
     std::chrono::steady_clock::time_point _RsLastFlushTime = std::chrono::steady_clock::now();
+
+    // decode-side loss measurement (mirrors lcrq's group fail-rate): without
+    // it the adaptive overhead loop is OPEN — latest_loss_rate stays 0, the
+    // PI integral drifts to its clamp and overhead saturates at a fixed value
+    // instead of tracking real line loss. A batch is "completed" when its
+    // repair slot is released (recovered / no gaps, or expired with gaps);
+    // the fail rate is fails / completed, IIR-smoothed into latest_loss_rate.
+    // Batch-granularity (not a time window) so the 200ms stall-guard latency
+    // cannot desync the skip count from the traffic it belongs to.
+    uint64_t _RsLossGroups = 0;  // completed batches
+    uint64_t _RsLossFails = 0;   // completed batches with unrecovered gaps
+    void UpdateLossRate();
 
     // small-packet dedup: redundancy copies of one small packet arrive
     // back-to-back; deliver only the first (like the lcrq REPEAT seen check).
