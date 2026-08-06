@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -65,13 +66,15 @@ private:
     uint32_t _RsBatchStartSeq = 0;
     std::chrono::steady_clock::time_point _RsBatchStartTime;
     bool _RsHaveBatch = false;
+    // repairs are spread out over ticks (1ms apart) instead of bursting
+    // together with the batch tail shard — intermediate devices drop
+    // transient bursts (UDPspeeder -t equivalent).
+    std::deque<Packet> _RsPendingRepairs;
+    std::chrono::steady_clock::time_point _RsLastRepairSend{};
 
     // decode state
     std::array<RsSrcSlot, kRsSrcSlots> _RsSrcs;
     std::array<RsRepairSlot, kRsRepairSlots> _RsRepairs;
-    uint32_t _RsDeliverSeq = 0;
-    bool _RsHaveWatermark = false;
-    std::chrono::steady_clock::time_point _RsLastFlushTime = std::chrono::steady_clock::now();
 
     // decode-side loss measurement (mirrors lcrq's group fail-rate): without
     // it the adaptive overhead loop is OPEN — latest_loss_rate stays 0, the
@@ -95,12 +98,10 @@ private:
     static uint32_t RsSymbolSize(const FecConfig& cfg);
 
     void EncodePacket(Packet&& p, std::vector<Packet>& out);
-    void SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq,
-                      std::vector<Packet>& out);
+    void SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq);
     void DecodePacket(Packet&& p, std::vector<Packet>& out);
-    void AdvanceWatermark(const std::chrono::steady_clock::time_point& now, std::vector<Packet>& out);
-    void RsFlushDelivery(std::vector<Packet>& out);
-    void RsTryRecover(uint32_t bid, uint32_t k);
+    void CleanupStaleBatches(const std::chrono::steady_clock::time_point& now);
+    void RsTryRecover(uint32_t bid, uint32_t k, std::vector<Packet>& out);
 };
 
 } // namespace gh
