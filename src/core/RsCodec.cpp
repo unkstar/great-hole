@@ -1,6 +1,7 @@
 #include "RsCodec.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <span>
 
@@ -149,15 +150,28 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
     const float fb_loss = _Shared ? _Shared->latest_loss_rate : 0.0f;
     const uint8_t fb = static_cast<uint8_t>(std::min(fb_loss * 250.0f, 250.0f));
     for (uint32_t j = 0; j < m; j++) {
-        Packet op; op._Length = 0;
-        op.PushBack(std::span<const uint8_t>(repairs[j].data(), T));
-        op.PushFrontLE(static_cast<uint8_t>(j));
-        op.PushFrontLE(static_cast<uint8_t>(k));
-        op.PushFrontLE(static_cast<uint16_t>(bid & 0xFFFF));
-        op.PushFrontLE(static_cast<uint8_t>((bid >> 16) & 0xFF));
-        op.PushFrontLE(fb);
-        op.PushFrontLE(BuildDword(bid, kRsRepair));
-        out.push_back(std::move(op));
+        // Send each repair twice: repairs ride the same lossy line as the
+        // shards (~1.6% here), and one lost repair silently kills recovery
+        // for its batch (missing > available, no retry). The decoder is
+        // idempotent on duplicate repairs (same idx overwrites, mask bit
+        // already set), so no decoder change is needed.
+        for (uint32_t dup = 0; dup < 2; dup++) {
+            Packet op; op._Length = 0;
+            op.PushBack(std::span<const uint8_t>(repairs[j].data(), T));
+            op.PushFrontLE(static_cast<uint8_t>(j));
+            op.PushFrontLE(static_cast<uint8_t>(k));
+            // Wire bytes are [lo16 | hi] = standard 24-bit LE. PushFrontLE
+            // prepends, so push the HIGH byte first, then the low 16 bits.
+            // (bbf1455 pushed low-16 first: wire became [hi lo0 lo1], the
+            // decoder rebuilt hi + (lo0<<8) + (lo1<<16) — a scrambled batch id
+            // on every packet, so repairs keyed to the wrong batch and
+            // recovery NEVER triggered.)
+            op.PushFrontLE(static_cast<uint8_t>((bid >> 16) & 0xFF));
+            op.PushFrontLE(static_cast<uint16_t>(bid & 0xFFFF));
+            op.PushFrontLE(fb);
+            op.PushFrontLE(BuildDword(bid, kRsRepair));
+            out.push_back(std::move(op));
+        }
     }
 }
 
@@ -199,10 +213,13 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
         const uint8_t idx = p.PopFrontLE<uint8_t>();
         if (p.DataSize() < T) return;
         auto& rep = _RsRepairs[bid & (kRsRepairSlots - 1)];
-        if (!rep.valid || rep.bid != bid) { rep.bid = bid; rep.k = k; rep.valid = true; rep.data.clear(); }
+        if (!rep.valid || rep.bid != bid) {
+            rep.bid = bid; rep.k = k; rep.valid = true; rep.data.clear(); rep.mask.fill(0);
+        }
         const size_t off = static_cast<size_t>(idx) * T;
         if (rep.data.size() < off + T) rep.data.resize(off + T);
         std::memcpy(rep.data.data() + off, p.Data().data(), T);
+        rep.mask[idx >> 3] |= static_cast<uint8_t>(1u << (idx & 7));
         rep.k = k;
         rep.time = std::chrono::steady_clock::now();
         RsTryRecover(bid, k);
@@ -242,6 +259,17 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     slot.payload[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
     std::memcpy(slot.payload.data() + 2, p.Data().data(), std::min<size_t>(len, p.DataSize()));
     if (!_RsHaveWatermark) { _RsHaveWatermark = true; _RsDeliverSeq = seq - 1; }
+    // Retry recovery on shard arrival: repairs can arrive while the batch's
+    // tail shards are still in flight (missing scan overcounts), and a
+    // "wait for more repairs" batch never gets rescanned once its repairs
+    // have all arrived. A shard arriving for a batch that has repairs
+    // re-triggers the scan.
+    {
+        auto& rep = _RsRepairs[seq & (kRsRepairSlots - 1)];
+        if (rep.valid && rep.bid <= seq && seq < static_cast<uint32_t>(rep.bid) + rep.k) {
+            RsTryRecover(rep.bid, rep.k);
+        }
+    }
     RsFlushDelivery(out);
     AdvanceWatermark(std::chrono::steady_clock::now(), out);
 }
@@ -324,7 +352,11 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k) {
         rep.data.clear();
         return;
     }
-    const size_t repairs_available = rep.data.size() / T;
+    // count only repairs actually received: an unarrived repair in the
+    // middle leaves a zero-filled slot that would otherwise decode as a
+    // real symbol (garbage output or a false "success")
+    size_t repairs_available = 0;
+    for (const uint8_t m : rep.mask) repairs_available += std::popcount(m);
     if (missing.size() > repairs_available) return;  // wait for more repairs
 
     // assemble known shards: source unit rows + repair Vandermonde rows
@@ -339,8 +371,9 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k) {
     }
     const uint8_t* rep_data = rep.data.data();
     for (uint32_t j = 0; j < k && known.size() < k; j++) {
+        if (!(rep.mask[j >> 3] & (1u << (j & 7)))) continue;  // never received
         const size_t off = static_cast<size_t>(j) * T;
-        if (off + T > rep.data.size()) break;
+        if (off + T > rep.data.size()) continue;
         known.push_back(std::vector<uint8_t>(rep_data + off, rep_data + off + T));
         rows.push_back(RS256::RepairRow(k, j));
     }

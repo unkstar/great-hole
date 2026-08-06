@@ -79,10 +79,16 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                 BOOST_LOG_TRIVIAL(warning) << "FecPipeline(" << this << ") read warning: " << err.message(); continue;
             }
             q->push_back(std::move(p));
-            // drain the input into the queue (EPOLLET: empty the buffer)
-            while (q->size() < 64 && !_Stop.IsTriggered()) {
+            // drain the input into the queue. EPOLLET (edge-triggered)
+            // invariant: the fd's buffer MUST be fully drained to EAGAIN or
+            // the next edge never fires for already-pending data — the reader
+            // then suspends while the device queue overflows and drops
+            // packets (observed: tun RX drops at both ends during TCP tests).
+            // The q grows unbounded anyway (the main loop paces consumption),
+            // so a q-size cap here only breaks the drain.
+            while (!_Stop.IsTriggered()) {
                 Packet p2;
-                if (_In->TryRead(p2)) break;
+                if (_In->TryRead(p2)) break;  // EAGAIN: fd empty
                 q->push_back(std::move(p2));
             }
         }

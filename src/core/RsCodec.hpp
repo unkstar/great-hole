@@ -47,6 +47,7 @@ private:
         bool valid = false;
         std::chrono::steady_clock::time_point time;
         std::vector<uint8_t> data;  // idx*T slots, capacity reused
+        std::array<uint8_t, 32> mask{};  // received repair idx bits (m <= 254)
     };
 
     const FecConfig& _Cfg;
