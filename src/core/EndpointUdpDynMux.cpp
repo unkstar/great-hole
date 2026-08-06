@@ -222,6 +222,11 @@ Omni::Fiber::Coroutine<ErrorCode> UdpDynMux::Channel::WriteBatch(std::vector<Pac
   if (!_Peer.has_value() || _RemoteRxId == 0)
     co_return ErrorCode{AppErrorCategory::kInvalidPacketSession, kAppError};
   if (pkts.empty()) co_return ErrorCode{};
+  // Send pacing: optional minimum inter-datagram gap in µs (0 = off).
+  // Pacing flattens transient bursts (UDPspeeder -j spirit) that trigger
+  // drops in intermediate devices. Costs one timer await per packet; keep
+  // 0 unless burst loss is actually observed on the path.
+  static constexpr uint32_t kSendPacingUs = 0;
   for (auto& p : pkts) {
     if (p._Offset < 2) continue;
     p.PushFront(_RemoteRxId);
@@ -232,6 +237,12 @@ Omni::Fiber::Coroutine<ErrorCode> UdpDynMux::Channel::WriteBatch(std::vector<Pac
       if (err == boost::asio::error::operation_aborted)
         co_return ErrorCode{AppErrorCategory::kOperationAborted, kAppError};
       co_return ErrorCode(err.value(), system_category());
+    }
+    if (kSendPacingUs > 0) {
+      boost::asio::steady_timer timer(_Parent._Socket.get_executor());
+      timer.expires_after(std::chrono::microseconds(kSendPacingUs));
+      co_await timer.async_wait(boost::asio::bind_cancellation_slot(
+          c.AsioSlot().Slot(), Omni::Fiber::AsioUseFiber));
     }
   }
   co_return ErrorCode{};

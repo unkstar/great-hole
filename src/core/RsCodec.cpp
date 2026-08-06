@@ -50,13 +50,21 @@ void RsCodec::Tick(std::vector<Packet>& out) {
     if (_IsEncoder) {
         // batch deadline must still fire while the queue is idle
         if (_RsHaveBatch && now - _RsBatchStartTime >= std::chrono::milliseconds(_Cfg.timeout_ms)) {
-            SendRsRepair(_RsBatch, _RsBatchStartSeq, out);
+            SendRsRepair(_RsBatch, _RsBatchStartSeq);
             _RsBatch.clear();
             _RsHaveBatch = false;
         }
+        // spread pending repairs: one per millisecond so they never burst
+        // together with the batch tail shard (UDPspeeder -t equivalent)
+        if (!_RsPendingRepairs.empty() &&
+            now - _RsLastRepairSend >= std::chrono::milliseconds(1)) {
+            out.push_back(std::move(_RsPendingRepairs.front()));
+            _RsPendingRepairs.pop_front();
+            _RsLastRepairSend = now;
+        }
     } else {
         UpdateLossRate();
-        AdvanceWatermark(now, out);
+        CleanupStaleBatches(now);
     }
 }
 
@@ -138,14 +146,13 @@ void RsCodec::EncodePacket(Packet&& p, std::vector<Packet>& out) {
     const bool full = _RsBatch.size() >= _Cfg.max_batch;
     const bool timed_out = (now - _RsBatchStartTime) >= std::chrono::milliseconds(_Cfg.timeout_ms);
     if (full || timed_out) {
-        SendRsRepair(_RsBatch, _RsBatchStartSeq, out);
+        SendRsRepair(_RsBatch, _RsBatchStartSeq);
         _RsBatch.clear();
         _RsHaveBatch = false;
     }
 }
 
-void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq,
-                           std::vector<Packet>& out) {
+void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq) {
     const uint32_t k = static_cast<uint32_t>(batch.size());
     if (k == 0) return;
     const uint32_t T = RsSymbolSize(_Cfg);
@@ -183,7 +190,7 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
         op.PushFrontLE(static_cast<uint16_t>(bid & 0xFFFF));
         op.PushFrontLE(fb);
         op.PushFrontLE(BuildDword(bid, kRsRepair));
-        out.push_back(std::move(op));
+        _RsPendingRepairs.push_back(std::move(op));  // spread out in Tick
     }
 }
 
@@ -235,8 +242,7 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
         rep.mask[idx >> 3] |= static_cast<uint8_t>(1u << (idx & 7));
         rep.k = k;
         rep.time = std::chrono::steady_clock::now();
-        RsTryRecover(bid, k);
-        RsFlushDelivery(out);
+        RsTryRecover(bid, k, out);
         return;
     }
 
@@ -262,8 +268,12 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
         out.push_back(std::move(op));
         return;
     }
-    // RS source shard: cache padded payload, deliver in seq order.
-    // Ring slot: O(1) insert, payload vector capacity reused across packets.
+    // RS source shard: cache padded payload, then deliver IMMEDIATELY.
+    // Out-of-order delivery is fine (TCP reorders; UDPspeeder mode-1 style):
+    // a gap never blocks later shards, and is never "skipped" into permanent
+    // loss by a watermark guard. The ring keeps a copy so repair recovery can
+    // fill gaps when the repairs arrive (recovered shards are delivered from
+    // RsTryRecover).
     auto& slot = _RsSrcs[seq & (kRsSrcSlots - 1)];
     slot.seq = seq;
     slot.valid = true;
@@ -271,7 +281,6 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     slot.payload[0] = static_cast<uint8_t>(len & 0xFF);
     slot.payload[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
     std::memcpy(slot.payload.data() + 2, p.Data().data(), std::min<size_t>(len, p.DataSize()));
-    if (!_RsHaveWatermark) { _RsHaveWatermark = true; _RsDeliverSeq = seq - 1; }
     // Retry recovery on shard arrival: repairs can arrive while the batch's
     // tail shards are still in flight (missing scan overcounts), and a
     // "wait for more repairs" batch never gets rescanned once its repairs
@@ -280,95 +289,40 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     {
         auto& rep = _RsRepairs[seq & (kRsRepairSlots - 1)];
         if (rep.valid && rep.bid <= seq && seq < static_cast<uint32_t>(rep.bid) + rep.k) {
-            RsTryRecover(rep.bid, rep.k);
+            RsTryRecover(rep.bid, rep.k, out);
         }
     }
-    RsFlushDelivery(out);
-    AdvanceWatermark(std::chrono::steady_clock::now(), out);
+    Packet op; op._Length = 0;
+    op.PushBack(std::span<const uint8_t>(slot.payload.data() + 2, len));
+    out.push_back(std::move(op));
 }
 
-void RsCodec::AdvanceWatermark(const std::chrono::steady_clock::time_point& now,
-                               std::vector<Packet>& out) {
-    // Global watermark stall guard: if delivery stalled past decode_timeout
-    // (missing shard whose repairs never arrived), skip the gap and continue.
-    if (!_RsHaveWatermark || now - _RsLastFlushTime <= std::chrono::milliseconds(_Cfg.decode_timeout_ms)) {
-        return;
-    }
-    // find the smallest valid cached seq at/after the watermark. Ring scan
-    // must track the MINIMUM seq, not the first valid slot in slot order —
-    // slot order is arbitrary (seq & mask), so the first hit can be far
-    // ahead, skipping (and losing) all shards in between.
-    uint32_t gap_seq = 0;
-    for (uint32_t i = 0; i < kRsSrcSlots; i++) {
-        const auto& s = _RsSrcs[i];
-        if (s.valid && s.seq >= _RsDeliverSeq + 1 && (gap_seq == 0 || s.seq < gap_seq)) {
-            gap_seq = s.seq;
-        }
-    }
-    if (gap_seq > _RsDeliverSeq + 1) {
-        const uint32_t skipped = gap_seq - 1 - _RsDeliverSeq;
-        _RsDeliverSeq = gap_seq - 1;
-        BOOST_LOG_TRIVIAL(warning) << "RsCodec watermark stall: skipped " << skipped << " missing shards";
-        // Skipped shards are confirmed loss: mark every repair slot whose
-        // batch overlaps the skipped range as failed (counted once). The
-        // cleanup path cannot detect these — the guard already advanced the
-        // watermark past them.
-        const uint32_t a = _RsDeliverSeq + 1;
-        const uint32_t b = gap_seq;
-        for (uint32_t i = 0; i < kRsRepairSlots; i++) {
-            auto& r = _RsRepairs[i];
-            if (!r.valid || r.completed) continue;
-            if (r.bid < b && a < static_cast<uint32_t>(r.bid) + r.k) {
-                _RsLossFails++;
-                r.completed = true;
-            }
-        }
-    }
-    _RsLastFlushTime = now;
-
-    // stale batch cleanup (throttled with the stall tick): force watermark
-    // past batches that can no longer recover
+void RsCodec::CleanupStaleBatches(const std::chrono::steady_clock::time_point& now) {
+    // Batch outcome accounting + slot release. A batch whose repair slot
+    // outlives decode_timeout without being completed (recovered or no-gap)
+    // is counted failed if any shard of it is still unseen in the ring.
+    // With out-of-order delivery nothing is ever "skipped" — late shards
+    // still deliver on arrival; this only feeds the loss-rate measurement
+    // (an overestimate is benign: it raises overhead, which speeds recovery).
     for (uint32_t i = 0; i < kRsRepairSlots; i++) {
         auto& r = _RsRepairs[i];
         if (!r.valid) continue;
-        if (now - r.time > std::chrono::milliseconds(_Cfg.decode_timeout_ms)) {
-            const uint32_t end = static_cast<uint32_t>(r.bid) + r.k;
+        if (now - r.time <= std::chrono::milliseconds(_Cfg.decode_timeout_ms)) continue;
+        if (!r.completed) {
             bool had_gap = false;
-            while (_RsHaveWatermark && _RsDeliverSeq + 1 < end) {
-                const auto& s = _RsSrcs[(_RsDeliverSeq + 1) & (kRsSrcSlots - 1)];
-                if (s.valid && s.seq == _RsDeliverSeq + 1) break;
-                _RsDeliverSeq++;
-                had_gap = true;
+            for (uint32_t s = r.bid; s < static_cast<uint32_t>(r.bid) + r.k; s++) {
+                const auto& slot = _RsSrcs[s & (kRsSrcSlots - 1)];
+                if (!(slot.valid && slot.seq == s)) { had_gap = true; break; }
             }
-            // batch completed (slot released): recovered/no-gap → ok;
-            // expired with unrecovered gaps and never completed → fail
-            _RsLossGroups++;
-            if (!r.completed && had_gap) _RsLossFails++;
-            r.valid = false;
-            r.data.clear();
+            if (had_gap) _RsLossFails++;
         }
-    }
-    RsFlushDelivery(out);
-}
-
-void RsCodec::RsFlushDelivery(std::vector<Packet>& out) {
-    while (_RsHaveWatermark) {
-        const uint32_t next = _RsDeliverSeq + 1;
-        auto& slot = _RsSrcs[next & (kRsSrcSlots - 1)];
-        if (!slot.valid || slot.seq != next) break;
-        _RsLastFlushTime = std::chrono::steady_clock::now();
-        const auto& payload = slot.payload;
-        const uint16_t len = static_cast<uint16_t>(payload[0]) | (static_cast<uint16_t>(payload[1]) << 8);
-        if (payload.size() < 2 + len) { slot.valid = false; _RsDeliverSeq++; continue; }
-        Packet op; op._Length = 0;
-        op.PushBack(std::span<const uint8_t>(payload.data() + 2, len));
-        slot.valid = false;
-        _RsDeliverSeq++;
-        out.push_back(std::move(op));
+        _RsLossGroups++;
+        r.valid = false;
+        r.data.clear();
     }
 }
 
-void RsCodec::RsTryRecover(uint32_t bid, uint32_t k) {
+void RsCodec::RsTryRecover(uint32_t bid, uint32_t k, std::vector<Packet>& out) {
     const uint32_t T = RsSymbolSize(_Cfg);
     auto& rep = _RsRepairs[bid & (kRsRepairSlots - 1)];
     if (!rep.valid || rep.bid != bid) return;
@@ -422,6 +376,14 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k) {
         slot.seq = s;
         slot.valid = true;
         slot.payload = std::move(out_src[s - bid]);
+        // deliver the recovered shard now (out-of-order, like the originals)
+        const uint16_t rlen = static_cast<uint16_t>(slot.payload[0]) |
+                              (static_cast<uint16_t>(slot.payload[1]) << 8);
+        if (slot.payload.size() >= 2 + rlen) {
+            Packet op; op._Length = 0;
+            op.PushBack(std::span<const uint8_t>(slot.payload.data() + 2, rlen));
+            out.push_back(std::move(op));
+        }
     }
     rep.completed = true;  // batch fully recovered → ok (counted at slot release)
 }
