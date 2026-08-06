@@ -126,6 +126,7 @@ public:
 
 private:
     float _MaxOverhead;
+    float _InitialOverhead;
     float _Kp;
     float _Ki;
     float _TargetLoss;
