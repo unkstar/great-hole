@@ -42,7 +42,7 @@ private:
         std::vector<uint8_t> payload;  // T-byte [len|data|pad], capacity reused
     };
     struct RsRepairSlot {
-        uint16_t bid = 0;
+        uint32_t bid = 0;  // full 24-bit batch start seq
         uint8_t k = 0;
         bool valid = false;
         std::chrono::steady_clock::time_point time;
@@ -70,6 +70,11 @@ private:
     uint32_t _RsDeliverSeq = 0;
     bool _RsHaveWatermark = false;
     std::chrono::steady_clock::time_point _RsLastFlushTime = std::chrono::steady_clock::now();
+
+    // small-packet dedup: redundancy copies of one small packet arrive
+    // back-to-back; deliver only the first (like the lcrq REPEAT seen check).
+    std::vector<uint8_t> _LastSmall;
+    bool _HaveLastSmall = false;
 
     uint8_t BuildFlags() const;
     uint32_t BuildDword(uint32_t seq, uint8_t flags) const;
