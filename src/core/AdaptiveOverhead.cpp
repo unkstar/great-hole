@@ -131,15 +131,19 @@ void AlgoEwmaDynamic::Reset() {
 
 AlgoPI::AlgoPI(float initial_overhead, float max_overhead, float Kp, float Ki, float target_loss,
                float i_max)
-    : _MaxOverhead(max_overhead), _Kp(Kp), _Ki(Ki), _TargetLoss(target_loss), _IMax(i_max),
-      _Integral(0.0f), _Overhead(initial_overhead) {}
+    : _MaxOverhead(max_overhead), _InitialOverhead(initial_overhead), _Kp(Kp), _Ki(Ki),
+      _TargetLoss(target_loss), _IMax(i_max), _Integral(0.0f), _Overhead(initial_overhead) {}
 
 void AlgoPI::Update(float loss_sample) {
     loss_sample = std::clamp(loss_sample, 0.0f, 1.0f);
     float error = _TargetLoss - loss_sample; // positive when loss < target
     _Integral = std::clamp(_Integral + error, -_IMax, _IMax);
     float overhead = _Kp * (-error) + _Ki * _Integral;
-    _Overhead = std::clamp(overhead, 0.0f, _MaxOverhead);
+    // Floor at the configured initial overhead: the formula alone goes
+    // negative at loss=0 (cold start with no measurement yet), which clamped
+    // to 0 and forced a ~60-batch re-climb — an eternity on a slow TCP
+    // stream, leaving batches with m=0-1 repairs.
+    _Overhead = std::clamp(overhead, _InitialOverhead, _MaxOverhead);
 }
 
 float AlgoPI::GetOverhead() const { return _Overhead; }
