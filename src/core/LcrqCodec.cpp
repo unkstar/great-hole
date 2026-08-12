@@ -122,6 +122,10 @@ void LcrqCodec::SendBatch(std::vector<Packet>& out) {
         uint32_t K = rq.K();
         float current_overhead = _OverheadCtrl ? _OverheadCtrl->GetOverhead() : _Cfg.overhead;
         uint32_t extra = static_cast<uint32_t>(std::ceil(K * current_overhead));
+        if (_Cfg.loss_deadband >= 0.0f && _Shared &&
+            _Shared->latest_loss_rate <= _Cfg.loss_deadband) {
+            extra = 0;
+        }
         uint32_t total_symbols = K + extra;
         out_symbols = total_symbols;
         if (total_symbols > 65535) total_symbols = 65535;

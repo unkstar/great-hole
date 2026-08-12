@@ -742,6 +742,7 @@ struct FecConfig {
 
     // === 自适应算法 ===
     uint8_t algo = 1;                  // 算法选择 0~7
+    float loss_deadband = -1.0f;       // -1=禁用; >=0: 实测丢包 ≤ 该值时编码器不发 repair (零丢包链路 0% 补偿)
 
     // === 可控丢包测试 ===
     uint8_t test_drop_pattern = 0;     // 丢包模型 0~6 (0=禁用)

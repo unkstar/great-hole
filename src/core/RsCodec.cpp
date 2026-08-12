@@ -158,6 +158,15 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
     const uint32_t T = RsSymbolSize(_Cfg);
     float oh = _OverheadCtrl ? _OverheadCtrl->GetOverhead() : _Cfg.overhead;
     if (_OverheadCtrl && _Shared) _OverheadCtrl->Update(_Shared->latest_loss_rate);
+    // loss_deadband: while the measured loss sits at/below the configured
+    // clean-link baseline, skip repairs entirely — ceil() quantization would
+    // otherwise send >=1 shard per batch (5% at max_batch=20) even on a
+    // loss-free line. Crossing the deadband restores m>=1 immediately (via
+    // the safety margin) and the controller ramps up from there.
+    if (_Cfg.loss_deadband >= 0.0f && _Shared &&
+        _Shared->latest_loss_rate <= _Cfg.loss_deadband) {
+        return;
+    }
     uint32_t m = static_cast<uint32_t>(std::ceil(k * oh));
     if (m > 255 - k) m = 255 - k;
     if (m == 0) return;
