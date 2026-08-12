@@ -24,10 +24,11 @@ local fec_cfg = {
     decode_timeout_ms = 200,
     algo = 1,
     safety_margin = 0.01,
-    -- loss_deadband: 本侧 encoder 管 A→T (ul) 方向。裸连 UDP 基准 0% (50M 双向实测)
-    -- → 0.5% 吸收 fb 量化噪声 (fb 步长 = 1/250 = 0.4%)。丢包 ≤ 0.5% 时不发 repair;
-    -- 超过后立即恢复 m≥1 并随 EWMA 爬升。两侧可独立配置 (链路不对称)。
-    loss_deadband = 0.005,
+    -- loss_deadband = -1 (禁用): 保留每批 m=1 的底补偿。理由 (2026-08-13 实测):
+    -- TCP 为主时 88M payload + 5% repair ≈ 99M wire < 100M 网口, 底补偿无代价;
+    -- 且单分片丢包对 TCP 完全隐形 (deadband=0 时丢包要等 ~1s 检测窗口, TCP 先吃
+    -- dup-ACK)。5% 的真实代价只在饱和 UDP (95M 时超网口 ~5%), 非常态。
+    loss_deadband = -1,
     loss_window_groups = 50,
     loss_alpha = 0.1,
 }
