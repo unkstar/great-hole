@@ -4,6 +4,7 @@
 
 **Implemented & Tested** — 全部 Phase 1-4 代码实现完成，Phase 5-7 矩阵测试通过（192/192, 0 失败）。
 8 种自适应算法在 100Mbps/100msRTT 下完成功能验证，PI 确认为最佳自适应算法。
+**RS Codec 主线完成 (2026-08-08)** — Vandermonde GF256 编码器上线 fec-test 隧道: TCP dl 88.5M / ul 65.2M (vs lcrq 16M), UDP 双向 0%, 补偿率 5.0%。详见文末 "RS 实测终态"。
 
 ## References
 
@@ -1234,3 +1235,72 @@ fec_cfg = {
 - UDP: ~90M+ (UDPspeeder 同构实测 94.6M; 编码余量 3 倍)
 - TCP: 接近 nofec (源包零延迟, 生产嵌套 38.9M 为参考)
 - 对比 lcrq: UDP 27M → ~90M (3.3×); TCP 16M → ~35M+ (2.2×)
+
+## RS 实测终态 (2026-08-08) — 主线完成
+
+> 分支 fec-writebatch (HEAD 7ea548c → cef207c), 两端部署最终构建。
+> 详细过程见 docs/HANDFOFF-2026-08-08-rs-fec-5-final.md
+
+### 最终结果 (fec-test 隧道 tokyo↔ali, 多次复现)
+
+| 测试 | lcrq (2026-08-05 基线) | RS 最终 | 生产隧道 (无 FEC + UDPspeeder) |
+|------|:---:|:---:|:---:|
+| TCP dl | 16.1M | **88.5 / 86.8M** | 85.3M |
+| TCP ul | 13.7M | **65.2 / 64.3M** | 52.5M |
+| UDP 50M 双向 | ~25-27M | **0% / 0%** | 0% / 0.0044% |
+| 实际补偿率 | ~5.7% (lcrq) | **5.0%** (repair/shard) | — |
+
+> 预期 (90M UDP / ~35M TCP) 全部达成; TCP 实测 88.5M 甚至接近生产隧道。
+
+### TCP 停滞根因链 (乱序投递修复前, 5a201ca)
+
+```
+线路偶发乱序/延迟 (线路本身 0% 丢, 裸连 UDP 100M 双向 0%)
+→ watermark 保序: 缺口卡 200ms → guard "跳过" = 暂时缺口变永久丢失
+→ dup ACK 风暴 (306 ACK/s = 13 倍) → 重传 burst (800-1000 shard/s)
+→ 中间设备丢 burst (裸连稳态 0% 丢; burst 时 31%)
+→ 循环自维持 → TCP 0.2-14M
+```
+
+**修复** = 乱序投递 (缺口不阻塞后续分片, 数据不丢, 交给 TCP 重排) + repair 摊开 (1ms 间隔, 避免与批次尾叠加 burst)。借鉴 UDPspeeder (mode 1 + -t)。
+
+**关键教训**: 曾把 15% 端到端差异归因线路 (ER-X)——被纠正: 裸连 100M 0% 证明线路不丢, 放大器在解码端自身。
+
+### 补偿率调查结论
+
+- **PI (algo=3) 在零丢包线路上必浪费**: 积分漂移把 overhead 推到 15.5% 固定高位; 配置 floor 只挡下限挡不住向上漂移 (ae9cbd9 修冷启动 m=0, 但漂移是设计行为)
+- **algo=1 (EWMA)**: `oh = loss/(1-loss) + safety`, 零丢包 ~5% (可衰减), 15% 丢包 ~19% — 与 UDPspeeder 多档按需同思路
+- 实测: 补偿率 15.5% → 5%, TCP ul 62 → 65M, 吞吐不降反升
+
+### 实际 wire format (纠正 2026-08-05 设计)
+
+RS repair 分片 (与设计"batch_id 2B + repair_index 1B"的偏差):
+
+```
+[DWORD: 24-bit bid + kRsRepair(bit6)][fb 1B][bid 24-bit LE (高字节在前)][k 1B][repair_idx 1B][T payload]
+```
+
+- **bid 全 24-bit** (非 2B): 16-bit 截断会在 seq > 65535 (~94MB 流量) 后错乱
+- 字节序教训 (f082528): PushFrontLE 逆序 prepend — 先 push 高字节再 push 低 16 位; 曾 push 低 16 先 → wire 变 [hi lo0 lo1], 解码重建出乱码 bid, repair 永不触发
+- RS 源分片: `[DWORD seq][fb 1B][u16 dlen][payload pad 至 T]`, 即收即发零 batch 延迟
+- 小包 (<256B payload) 直发: kRsSmall(bit3) + 自适应重复 (seq=0 不占 RS 序号空间)
+- kRsRepair 复用 kRepeat 位 (bit6): RS 模式下 kRepeat 永不置位
+
+### 最终配置推荐 (零丢包/近零丢包链路)
+
+```lua
+-- configs/fec-test-*.lua (已入库)
+fec_codec = "rs",
+algo = 1,              -- EWMA + Static Safety
+overhead = 0.03,       -- 实测补偿率 5.0% (vs PI 的 15.5%)
+decode_timeout = 200,
+```
+
+丢包链路选型仍沿用矩阵测试决策树 (PI 最佳自适应 / MIMD 最可靠)。
+
+### 遗留
+
+1. TCP 重传仍高 (dl ~1105-1953): 乱序投递的 dup ACK 快速重传, 数据全到无害; 若要压低 → repair 摊开间隔 / timeout 调优
+2. 24h soak 未做
+3. 反向 80M UDP 未重测 (50M 已 0%)
+4. 生产隧道 (无 FEC great-hole + UDPspeeder) 是否升级到 RS 构建: 未评估
