@@ -84,8 +84,8 @@ private:
     // the fail rate is fails / completed, IIR-smoothed into latest_loss_rate.
     // Batch-granularity (not a time window) so the 200ms stall-guard latency
     // cannot desync the skip count from the traffic it belongs to.
-    uint64_t _RsLossGroups = 0;  // completed batches
-    uint64_t _RsLossFails = 0;   // completed batches with unrecovered gaps
+    uint64_t _RsLossGroups = 0;  // shard samples (source-slot evictions)
+    uint64_t _RsLossFails = 0;   // shards lost on the wire (raw loss)
     void UpdateLossRate();
 
     // small-packet dedup: redundancy copies of one small packet arrive
