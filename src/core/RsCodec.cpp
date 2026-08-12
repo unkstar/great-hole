@@ -160,14 +160,14 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
     if (k == 0) return;
     const uint32_t T = RsSymbolSize(_Cfg);
     float oh = _OverheadCtrl ? _OverheadCtrl->GetOverhead() : _Cfg.overhead;
-    if (_OverheadCtrl && _Shared) _OverheadCtrl->Update(_Shared->latest_loss_rate);
+    if (_OverheadCtrl && _Shared) _OverheadCtrl->Update(_Shared->peer_loss_rate);
     // loss_deadband: while the measured loss sits at/below the configured
     // clean-link baseline, skip repairs entirely — ceil() quantization would
     // otherwise send >=1 shard per batch (5% at max_batch=20) even on a
     // loss-free line. Crossing the deadband restores m>=1 immediately (via
     // the safety margin) and the controller ramps up from there.
     if (_Cfg.loss_deadband >= 0.0f && _Shared &&
-        _Shared->latest_loss_rate <= _Cfg.loss_deadband) {
+        _Shared->peer_loss_rate <= _Cfg.loss_deadband) {
         return;
     }
     uint32_t m = static_cast<uint32_t>(std::ceil(k * oh));
@@ -220,7 +220,7 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     }
     _TotalPackets++;
     const uint8_t fb = p.PopFrontLE<uint8_t>();
-    if (_Shared && fb <= 250) { _Shared->latest_loss_rate = static_cast<float>(fb) / 250.0f; }
+    if (_Shared && fb <= 250) { _Shared->peer_loss_rate = static_cast<float>(fb) / 250.0f; }
     bool has_echo = (f & kEcho) != 0;
     if (has_echo) {
         if (p.DataSize() < 8) return;

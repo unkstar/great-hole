@@ -27,6 +27,13 @@ struct FecSharedState {
     uint32_t consecutive_ping_lost = 0;
     // Latest measured loss rate from decoder [0..1] (encoder reads for feedback byte)
     float latest_loss_rate = 0.0f;
+    // Peer's measured loss rate [0..1], decoded from the fb byte on incoming
+    // packets. This is the loss on the direction the LOCAL encoder protects,
+    // so the encoder's overhead controller and loss_deadband gate read this —
+    // NOT latest_loss_rate (which is the local decoder's measurement of the
+    // opposite direction; mixing both in one field let a clean reverse
+    // direction zero out the lossy direction's measurement on every packet).
+    float peer_loss_rate = 0.0f;
 };
 
 // Wire format flags (shared by all codecs and the transport's PING/FEEDBACK)
