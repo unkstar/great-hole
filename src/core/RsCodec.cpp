@@ -69,12 +69,15 @@ void RsCodec::Tick(std::vector<Packet>& out) {
 }
 
 void RsCodec::UpdateLossRate() {
-    // Batch-granularity fail rate, mirrors lcrq: update once per
-    // loss_window_groups completed batches, IIR-smoothed into the shared
-    // loss rate (which the local encoder reads, and which the fb byte
-    // carries to the peer encoder for the opposite direction).
+    // Raw-loss accounting, shard-granular (one event per slot eviction), so
+    // it works with zero repairs in flight — the repair-slot-driven batch
+    // accounting latched at 0 when loss_deadband suppressed repairs (no
+    // repair slot created -> no measurement -> deadband never exits).
+    // Window scaled by max_batch to keep the update cadence equivalent to
+    // the old loss_window_groups batches (~50 x 20 shards).
     if (!_Shared) return;
-    const uint32_t window = _Cfg.loss_window_groups > 0 ? _Cfg.loss_window_groups : 50;
+    const uint32_t window = (_Cfg.loss_window_groups > 0 ? _Cfg.loss_window_groups : 50) *
+                            std::max<uint32_t>(_Cfg.max_batch, 1);
     if (_RsLossGroups < window) return;
     const float fail_rate = static_cast<float>(_RsLossFails) / static_cast<float>(_RsLossGroups);
     const float alpha = _Cfg.loss_alpha > 0 ? _Cfg.loss_alpha : 0.1f;
@@ -284,6 +287,17 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     // fill gaps when the repairs arrive (recovered shards are delivered from
     // RsTryRecover).
     auto& slot = _RsSrcs[seq & (kRsSrcSlots - 1)];
+    // Raw-loss accounting at slot eviction, independent of repair arrival
+    // (repairs may be disabled by loss_deadband). When this shard claims the
+    // slot, the previous occupant should be seq - kRsSrcSlots (one full ring
+    // cycle ago — a generous grace period for reordering). If it never
+    // arrived, it is a loss. One event per shard, so fails/groups are
+    // shard-granular.
+    if (slot.valid) {
+        const uint32_t expected = (seq - kRsSrcSlots) & 0xFFFFFF;
+        if (slot.seq != expected) _RsLossFails++;
+        _RsLossGroups++;
+    }
     slot.seq = seq;
     slot.valid = true;
     if (slot.payload.size() != T) slot.payload.resize(T);
@@ -307,25 +321,13 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
 }
 
 void RsCodec::CleanupStaleBatches(const std::chrono::steady_clock::time_point& now) {
-    // Batch outcome accounting + slot release. A batch whose repair slot
-    // outlives decode_timeout without being completed (recovered or no-gap)
-    // is counted failed if any shard of it is still unseen in the ring.
-    // With out-of-order delivery nothing is ever "skipped" — late shards
-    // still deliver on arrival; this only feeds the loss-rate measurement
-    // (an overestimate is benign: it raises overhead, which speeds recovery).
+    // Repair slot release. Loss accounting no longer lives here: it is
+    // shard-granular at source-slot eviction (DecodePacket), so it keeps
+    // working while loss_deadband suppresses repairs.
     for (uint32_t i = 0; i < kRsRepairSlots; i++) {
         auto& r = _RsRepairs[i];
         if (!r.valid) continue;
         if (now - r.time <= std::chrono::milliseconds(_Cfg.decode_timeout_ms)) continue;
-        if (!r.completed) {
-            bool had_gap = false;
-            for (uint32_t s = r.bid; s < static_cast<uint32_t>(r.bid) + r.k; s++) {
-                const auto& slot = _RsSrcs[s & (kRsSrcSlots - 1)];
-                if (!(slot.valid && slot.seq == s)) { had_gap = true; break; }
-            }
-            if (had_gap) _RsLossFails++;
-        }
-        _RsLossGroups++;
         r.valid = false;
         r.data.clear();
     }
