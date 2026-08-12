@@ -105,31 +105,32 @@ Future optimization: implement "send-immediately + repair-later" (UDPspeeder Mod
 
 ## 7. Phase 7: Real-world Validation
 
-- [ ] 7.1 Deploy to ali-osaka production-like config with FEC enabled (测试专用链路 fec-test 已搭好, 2026-08-05)
-- [~] 7.2 iperf3 TCP 短时测试已跑 (FEC 13.7~16.1M vs 直连 36~92M), 1h+ 长时未做
-- [~] 7.3 iperf3 UDP 短时测试已跑 (FEC ~25-27M vs 直连 76-95M), 1h+ 长时未做
-- [x] 7.4 实际 overhead 与吞吐上限已测量: **1 vCPU 是 FEC 编码器瓶颈 (~27Mbps)** — 结果见 fec-spec.md 2026-08-05 基线
-- [ ] 7.5 Document recommended algorithm + config for different link profiles
+- [x] 7.1 Deploy to ali-osaka production-like config with FEC enabled (测试专用链路 fec-test 2026-08-05 搭好; 最终构建 7ea548c 两端运行: tokyo `great-hole-fec-test-tokyo` + ali `great-hole-fec-test-ali`, algo=1/overhead=0.03)
+- [~] 7.2 iperf3 TCP 短时测试已跑: lcrq 13.7~16.1M → **RS 最终 dl 88.5/86.8M, ul 65.2/64.3M** (2026-08-08, 多次复现); 1h+ 长时未做
+- [~] 7.3 iperf3 UDP 短时测试已跑: lcrq ~25-27M → **RS 最终 50M 双向 0% / 0%**; 反向 80M 未重测; 1h+ 长时未做
+- [x] 7.4 实际 overhead 与吞吐上限已测量: **1 vCPU 是 RaptorQ 编码器瓶颈 (~27Mbps)** — 结果见 fec-spec.md 2026-08-05 基线; RS 换码后瓶颈解除 (标量 280M)
+- [x] 7.5 Document recommended algorithm + config for different link profiles: 零丢包链路 = **algo=1 (EWMA+Static) + overhead=0.03** (实测补偿率 5.0%, 见 fec-spec.md 2026-08-08 节); 丢包链路沿用矩阵测试决策树 (PI 最佳自适应) — 配置已入库 `configs/fec-test-*.lua`
 - [ ] 7.6 24h+ stability soak test (no memory leaks, no ring buffer issues)
 
-## 9. Phase 9: RS Codec (Vandermonde GF256) — 可选 FEC 实现
+## 9. Phase 9: RS Codec (Vandermonde GF256) — 已完成 (2026-08-05 ~ 2026-08-08)
 
 > 动机: tokyo vCPU 上 RaptorQ 27M vs RS 标量实测 280M (K=17)。RS 无中间符号消元, 且系统化源分片即收即发 (零 batch 延迟, TCP 友好)。lcrq 保留为默认。
+> 结论: 主线全部解决并验证 — TCP 停滞根因 = watermark 保序把暂时缺口变永久丢失, 已用乱序投递修复 (5a201ca); 补偿率浪费 = PI 零丢包积分漂移, 已切 algo=1 EWMA+0.03 (7ea548c)。详见 docs/HANDFOFF-2026-08-08-rs-fec-5-final.md
 
-- [ ] 9.1 GF(256) 库: EXP/LOG 查表 + Vandermonde 系数构造 + fec_encode (逐 repair 生成) + fec_decode (k×k 高斯消元求逆) — 或引入 Rizzo fec.cpp (GPL-2.0 兼容)
-- [ ] 9.2 FecConfig 加 `fec_codec` 字段 ("lcrq" 默认 / "rs"), Lua 绑定
-- [ ] 9.3 RS 编码路径: systematic 源分片即发 + batch 窗口到期按 AdaptiveOverhead 补发 m 个 repair
-- [ ] 9.4 RS 解码路径: 序号缺口检测 + repair 收集 + k×k 高斯消元恢复 (无丢包零开销)
-- [ ] 9.5 wire format: repair 分片头 (batch_id 2B + repair_index 1B), 源分片复用 DWORD 头
-- [ ] 9.6 max_batch 约束: k+m ≤ 255 (GF256), 建议 max_batch ≤ 100 (冗余上限 155 = 37% 覆盖)
-- [ ] 9.7 矩阵测试: 8 算法 × 6 模式 × 4 速率跑 RS codec (复用 fec_matrix_test.py)
-- [ ] 9.8 隧道实测: ali↔tokyo fec-test 链路 TCP/UDP vs lcrq 对比 (预期 UDP ~90M / TCP 接近 nofec)
-- [ ] 9.9 spec 最终化: RS 实测数据回填 + 算法选型建议
+- [x] 9.1 GF(256) 库: `src/core/RS256.hpp/cpp` 自研 (EXP/LOG 查表 + Vandermonde 系数构造 + EncodeRepair 逐 repair 生成 + Decode k×k 高斯消元求逆), 无 GPL 依赖, 未引入 Rizzo fec.cpp
+- [x] 9.2 FecConfig 加 `fec_codec` 字段 ("lcrq" 默认 / "rs") + Lua 绑定 — FecConfig.hpp:9, LuaLib.cpp:200-201
+- [x] 9.3 RS 编码路径: systematic 源分片即发 + batch 窗口到期按 AdaptiveOverhead 补发 m 个 repair (`RsCodec::EncodePacket` / `SendRsRepair`)
+- [x] 9.4 RS 解码路径: 序号缺口检测 + repair 收集 + k×k 高斯消元恢复; **乱序投递** (缺口不阻塞后续分片, 修复后补投) — TCP 停滞根因修复 (5a201ca)
+- [x] 9.5 wire format: repair = [DWORD bid+kRsRepair][fb 1B][bid 24-bit LE][k 1B][repair_idx 1B][T payload]; 源分片复用 DWORD 头; 小包直发 kRsSmall(bit3)。**偏差**: bid 为全 24-bit (原计划 2B) — 16-bit 截断会在 >94MB 流量后错乱, 且字节序曾错 (f082528 修复)
+- [x] 9.6 max_batch 约束: k+m ≤ 255 clamp 已实现 (RsCodec.cpp:162), max_batch 默认 200
+- [ ] 9.7 矩阵测试: fec_matrix_test.py 仍为 lcrq-only, RS codec 的 8×6×4 矩阵未跑 (RS 与 lcrq 共享 AdaptiveOverhead/LossPattern, 算法行为可预期, 但未实测验证)
+- [x] 9.8 隧道实测: ali↔tokyo fec-test — **TCP dl 88.5/86.8M, ul 65.2/64.3M; UDP 50M 双向 0%; 实测补偿率 5.0%** (vs lcrq 同链路 TCP 13.7~16.1M / UDP ~27M)
+- [x] 9.9 spec 最终化: RS 实测数据回填 fec-spec.md 2026-08-08 节 (本次更新) + 零丢包链路选型 = algo=1 EWMA + overhead=0.03
 
 ## 8. Phase 8: Polish
 
 - [x] 8.0 修复 lcrq 构建集成缺陷: 丢失的 libs/lcrq/CMakeLists.txt 从 ali 部署副本找回, 正式化为 cmake/lcrq.cmake + cmake/lcrq-install.sh (BUILD_IN_SOURCE + ar 打包 + 头文件安装), 全新 clone 可复现构建 (2026-08-05)
-- [ ] 8.1 Add FEC-specific metrics/logging (overhead history, RTT EWMA, decode success rate)
+- [~] 8.1 Add FEC-specific metrics/logging (overhead history, RTT EWMA, decode success rate): 批次口径丢包统计 + RsLossRate debug 日志已随 RS 落地; 完整 metrics 输出 (overhead history/RTT EWMA 序列) 未做
 - [ ] 8.2 Evaluate removing any algorithms that consistently underperform
-- [ ] 8.3 Update `openspec/specs/fec-spec.md` with final decisions from test results
-- [ ] 8.4 Archive this change: `openspec archive fec-implementation`
+- [x] 8.3 Update `openspec/specs/fec-spec.md` with final decisions from test results — RS 终态数据 + 根因链 + 选型决策已回填 (2026-08-08 节)
+- [ ] 8.4 Archive this change: `openspec archive fec-implementation` — 待 7.6 (24h soak) / 反向 80M 完成后执行

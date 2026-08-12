@@ -58,11 +58,26 @@ Pipeline 架构是单 fiber 的 Read→Filters→Write 链路。FEC 需要 batch
 **原因**: lcrq 是 autotools 项目，无 CMake 支持。静态链接避免运行时依赖。
 **替代方案**: 手工移植 lcrq 源码到 CMake → 维护成本高，上游更新困难。
 
+### 7. fec_codec 双编解码器: RS (Vandermonde GF256) 作为 lcrq 部署替选 (2026-08-05 新增)
+
+**选择**: `FecCodec` 策略接口 + `fec_codec` 配置二选一 ("lcrq" 默认 / "rs")，AdaptiveOverhead / LossPattern / wire 头复用。
+**原因**: tokyo 部署环境 vCPU 算力配额低，lcrq 小 K 编码实测 ~27-30M (无 AVX-512 透传)；RS 标量实测 280M (K=17)。RS 系统化源分片即收即发 (零 batch 延迟) 对 TCP 更友好。
+**替代方案**: 换更高算力 vCPU / AVX-512 实例 → 不可控 (云未透传)；REPEAT 快路径 → 无冗余保护。
+
+### 8. RS 乱序投递 (2026-08-08, TCP 停滞根因修复)
+
+**选择**: 解码端缺口不阻塞后续分片，直接交付 (乱序)，repair 到达后补投缺口；encoder 侧 repair 以 1ms 间隔摊开发送。
+**原因**: watermark 保序曾把"暂时缺口"变成"永久丢失" (guard 跳过)，引发 dup ACK 风暴 → 重传 burst → 中间设备丢 burst → 自维持循环 (TCP 0.2-14M)。乱序交付 + repair 摊开后 TCP 88.5M。
+**替代方案**: 保序 + 更长超时 → 延迟放大，ACK 压缩；UDPspeeder mode 1 + -t 已被验证为正确模式。
+
 ## Risks / Trade-offs
 
 - **[RTT 延迟]** PING/FEEDBACK 闭环有 1 RTT 延迟，丢包突变时前几个 group 可能保护不足 → 用 REPEAT 兜底单包场景，MIMD 算法快速响应
-- **[lcrq 许可证]** GPL-2.0 → 本项目也需 GPL 兼容。已确认 great-hole 是 GPL-3.0
+- **[lcrq 许可证]** GPL-2.0 → 本项目也需 GPL 兼容。已确认 great-hole 是 GPL-3.0；RS256 为自研实现，无此问题
 - **[大 K 内存]** K=56403 时 RaptorQ 内部矩阵可达数百 MB → `max_batch` 限制 K ≤ 200（约 300KB symbol×200=60MB blob），实测够用
 - **[ring buffer 溢出]** `decode_window=64` 限制并发 group 数 → 超时驱逐机制兜底，burst 场景可能丢旧 group
 - **[定时器精度]** fiber timer 基于 `steady_timer` + `AsioUseFiber`，精度受 io_context 调度影响 → 3×RTT+timeout 的 decode_timeout 已留余量
 - **[REPEAT MTU]** 原始包 + IV + header 可能超过 MTU → `SendBatch` 中检查，超出时跳过 REPEAT 走 FEC 编码
+- **[PI 零丢包积分漂移]** PI 在零丢包线路上把 overhead 推到 15.5% 高位 (积分漂移是设计行为，floor 只挡下限) → 零丢包链路用 algo=1 EWMA (实测补偿率 5.0%)
+- **[RS repair bid 截断]** bid 用 16-bit 会在 >94MB 流量后错乱，且 PushFrontLE 逆序 prepend 曾致字节序错乱 (f082528 修复) → bid 全 24-bit，push 顺序: 高字节先、低 16 后
+- **[RS 乱序投递副作用]** TCP dup ACK 快速重传偏高 (dl ~1105-1953)，数据全到无害 → 可再调优 repair 摊开间隔
