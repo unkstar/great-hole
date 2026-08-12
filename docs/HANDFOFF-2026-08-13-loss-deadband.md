@@ -1,7 +1,13 @@
 # Handoff: loss_deadband — 零丢包 0% 补偿 (2026-08-13)
 
-**状态**: 完成并部署验证。零丢包线路 compensation 从 5% → **0%**;丢包出现时 deadband 及时退出并恢复保护。
-**分支**: `fec-writebatch` (**HEAD = 94f26de**),两端 fec-test 隧道已运行此构建。
+**状态**: 功能实现并验证;**最终决策 = 禁用**(loss_deadband = -1),保留每批 m=1 底补偿。测量环路修复保留。
+**分支**: `fec-writebatch` (**HEAD = ca8bec9**),两端 fec-test 隧道运行此构建。
+
+**决策理由** (2026-08-13 实测):
+- TCP 为主场景,5% 底补偿零成本: 88M payload + 5% repair ≈ 99M wire < 100M 网口
+- 底补偿使单分片丢包对 TCP 隐形;deadband=0 时丢包要等 ~1s 检测窗口,期间 TCP 吃 dup-ACK
+- 5% 的真实代价只在饱和 UDP (95M 发送时超网口 ~5%),非常态
+- 已证明 TCP 速率与补偿无关 (88.5M@5% vs 88.4M@0%,两个不同瓶颈恰好落在同一数字)
 
 ---
 
