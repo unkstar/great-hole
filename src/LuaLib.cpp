@@ -265,6 +265,9 @@ static void fec_pipeline_new(lua_State* L) {
     lua_getfield(L, 4, "safety_margin");
     if (lua_isnumber(L, -1)) cfg.safety_margin = (float)lua_tonumber(L, -1);
     lua_pop(L, 1);
+    lua_getfield(L, 4, "loss_deadband");
+    if (lua_isnumber(L, -1)) cfg.loss_deadband = (float)lua_tonumber(L, -1);
+    lua_pop(L, 1);
 
     // === Controllable packet loss ===
     lua_getfield(L, 4, "test_drop_pattern");
