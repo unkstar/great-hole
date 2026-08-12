@@ -24,6 +24,10 @@ local fec_cfg = {
     decode_timeout_ms = 200,
     algo = 1,
     safety_margin = 0.01,
+    -- loss_deadband: 本侧 encoder 管 A→T (ul) 方向。裸连 UDP 基准 0% (50M 双向实测)
+    -- → 0.5% 吸收 fb 量化噪声 (fb 步长 = 1/250 = 0.4%)。丢包 ≤ 0.5% 时不发 repair;
+    -- 超过后立即恢复 m≥1 并随 EWMA 爬升。两侧可独立配置 (链路不对称)。
+    loss_deadband = 0.005,
     loss_window_groups = 50,
     loss_alpha = 0.1,
 }
