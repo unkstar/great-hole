@@ -76,14 +76,12 @@ private:
     std::array<RsSrcSlot, kRsSrcSlots> _RsSrcs;
     std::array<RsRepairSlot, kRsRepairSlots> _RsRepairs;
 
-    // decode-side loss measurement (mirrors lcrq's group fail-rate): without
-    // it the adaptive overhead loop is OPEN — latest_loss_rate stays 0, the
-    // PI integral drifts to its clamp and overhead saturates at a fixed value
-    // instead of tracking real line loss. A batch is "completed" when its
-    // repair slot is released (recovered / no gaps, or expired with gaps);
-    // the fail rate is fails / completed, IIR-smoothed into latest_loss_rate.
-    // Batch-granularity (not a time window) so the 200ms stall-guard latency
-    // cannot desync the skip count from the traffic it belongs to.
+    // decode-side loss measurement: shard-granular raw wire loss, counted at
+    // source-slot eviction (see DecodePacket), so it works with zero repairs
+    // in flight — the old repair-slot-driven batch accounting latched at 0
+    // when loss_deadband suppressed repairs. The fail rate is fails / samples,
+    // IIR-smoothed into latest_loss_rate (which the local encoder stamps into
+    // the fb byte; the peer consumes it as peer_loss_rate for its encoder).
     uint64_t _RsLossGroups = 0;  // shard samples (source-slot evictions)
     uint64_t _RsLossFails = 0;   // shards lost on the wire (raw loss)
     void UpdateLossRate();

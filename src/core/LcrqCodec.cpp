@@ -123,7 +123,7 @@ void LcrqCodec::SendBatch(std::vector<Packet>& out) {
         float current_overhead = _OverheadCtrl ? _OverheadCtrl->GetOverhead() : _Cfg.overhead;
         uint32_t extra = static_cast<uint32_t>(std::ceil(K * current_overhead));
         if (_Cfg.loss_deadband >= 0.0f && _Shared &&
-            _Shared->latest_loss_rate <= _Cfg.loss_deadband) {
+            _Shared->peer_loss_rate <= _Cfg.loss_deadband) {
             extra = 0;
         }
         uint32_t total_symbols = K + extra;
@@ -217,7 +217,7 @@ void LcrqCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     }
     _TotalPackets++;
     uint8_t fb = p.PopFrontLE<uint8_t>();
-    if (_Shared && fb <= 250) { _Shared->latest_loss_rate = static_cast<float>(fb) / 250.0f; }
+    if (_Shared && fb <= 250) { _Shared->peer_loss_rate = static_cast<float>(fb) / 250.0f; }
     uint64_t echo = 0;
     bool has_echo = (f & kEcho) != 0;
     if (has_echo) {
