@@ -30,9 +30,9 @@ TABLE_ERX=102
 MSS=1380
 
 # 生产嵌套隧道 (great-hole nofec + speederv2)
-PROD_ALI_IF="fec-tokyo";  PROD_GW="172.31.30.2";  PROD_TOKYO_PEER="172.31.30.1"
+PROD_ALI_IF="fec-tokyo";  PROD_ALI_IP="172.31.30.1";  PROD_GW="172.31.30.2";  PROD_TOKYO_PEER="172.31.30.1"
 # RS FEC 隧道 (great-hole-fec-test, 端口 20086)
-FEC_ALI_IF="fec-test";    FEC_GW="172.31.40.2";    FEC_TOKYO_PEER="172.31.40.1"
+FEC_ALI_IF="fec-test";    FEC_ALI_IP="172.31.40.1";    FEC_GW="172.31.40.2";    FEC_TOKYO_PEER="172.31.40.1"
 
 # 在 ali 以 root 执行 (stdin 传入脚本内容)
 ali_root() {
@@ -77,27 +77,30 @@ iptables -t nat -C POSTROUTING -s ${subnet} -o eth0 -j MASQUERADE 2>/dev/null ||
 EOF
 }
 
-update_router_url() {  # $1 = tokyo 端 TUN IP (routes 下载地址)
+update_router_url() {  # $1 = tokyo 端 TUN IP (routes 下载地址); 从 ali 执行 (与 switch-exit 一致, 本机可能到不了路由器)
     local gw="$1"
-    ssh -o BatchMode=yes -o PasswordAuthentication=no -o ConnectTimeout=5 router \
-        "sudo sed -i -E 's|http://172\.31\.(30|40)\.2/routes/|http://${gw}/routes/|g' /config/scripts/update-routes.sh" \
+    # 注意 KexAlgorithms: 老 EdgeOS 设备需要 (本机 ~/.ssh/config 的 Host router 同款配置)
+    ssh -o BatchMode=yes -o PasswordAuthentication=no -o ConnectTimeout=5 "$ALI_HOST" \
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 -o KexAlgorithms=+diffie-hellman-group1-sha1 unkstar@192.168.2.1 \"sudo sed -i -E 's|http://172\.31\.(30|40)\.2/routes/|http://${gw}/routes/|g' /config/scripts/update-routes.sh\"" \
         2>/dev/null || echo "  WARNING: 无法更新路由器 update-routes.sh (router 不可达?)"
 }
 
 do_switch() {  # $1 = mode: prod|fec
-    local mode="$1" gw if peer subnet
+    local mode="$1" gw if peer subnet ali_ip
     if [ "$mode" = "fec" ]; then
-        gw="$FEC_GW"; if="$FEC_ALI_IF"; peer="$FEC_TOKYO_PEER"; subnet="172.31.40.0/30"
+        gw="$FEC_GW"; if="$FEC_ALI_IF"; peer="$FEC_TOKYO_PEER"; subnet="172.31.40.0/30"; ali_ip="$FEC_ALI_IP"
         echo "=== 切换到 fec 隧道 (RS FEC): $if / $gw ==="
     else
-        gw="$PROD_GW"; if="$PROD_ALI_IF"; peer="$PROD_TOKYO_PEER"; subnet="172.31.30.0/30"
+        gw="$PROD_GW"; if="$PROD_ALI_IF"; peer="$PROD_TOKYO_PEER"; subnet="172.31.30.0/30"; ali_ip="$PROD_ALI_IP"
         echo "=== 切换到生产嵌套隧道: $if / $gw ==="
     fi
 
-    # 前置检查: 目标网关隧道连通性 (ali 视角)
+    # 前置检查: 目标网关隧道连通性 (ali 视角)。必须 -I 显式指定源地址:
+    # 裸 ping 的源地址由内核按接口主地址选择, 残留地址会导致误判 (2026-08-13
+    # 生产 fec-tokyo 上的旧 172.31.32.1 曾让回切 ping 门禁误报失败)。
     echo "--- 检查隧道连通性 (ali ping $gw) ---"
     if ! ssh -o BatchMode=yes -o PasswordAuthentication=no -o ConnectTimeout=5 "$ALI_HOST" \
-        "ping -c 1 -W 2 $gw >/dev/null 2>&1"; then
+        "ping -I ${ali_ip} -c 1 -W 2 $gw >/dev/null 2>&1"; then
         echo "ERROR: 隧道不可达 ($gw), 放弃切换" >&2
         exit 1
     fi
