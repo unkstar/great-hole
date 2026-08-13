@@ -63,12 +63,17 @@ iptables -C FORWARD -o ${if} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 
 EOF
 }
 
-tokyo_switch() {  # $1 = ali 端隧道 peer IP, $2 = tokyo 侧隧道接口
-    local peer="$1" if="$2"
+tokyo_switch() {  # $1 = ali 端隧道 peer IP, $2 = tokyo 侧隧道接口, $3 = 隧道子网 (ali 出口伪装后的源地址段)
+    local peer="$1" if="$2" subnet="$3"
     tokyo_root <<EOF
 set -e
 ip route replace ${OVPN_NET} via ${peer} dev ${if}
 ip route replace ${WG_NET} via ${peer} dev ${if}
+# 关键: ali 侧 POSTROUTING 把家庭流量伪装成出口接口 IP (即 ali 的隧道 IP),
+# 因此 tokyo 必须对当前隧道子网做 MASQUERADE, 否则 SYN 带私网源地址出网、
+# 回包永远回不来 (2026-08-13 切换 fec 后断网根因)。
+iptables -t nat -C POSTROUTING -s ${subnet} -o eth0 -j MASQUERADE 2>/dev/null || \\
+    iptables -t nat -A POSTROUTING -s ${subnet} -o eth0 -j MASQUERADE
 EOF
 }
 
@@ -80,12 +85,12 @@ update_router_url() {  # $1 = tokyo 端 TUN IP (routes 下载地址)
 }
 
 do_switch() {  # $1 = mode: prod|fec
-    local mode="$1" gw if peer
+    local mode="$1" gw if peer subnet
     if [ "$mode" = "fec" ]; then
-        gw="$FEC_GW"; if="$FEC_ALI_IF"; peer="$FEC_TOKYO_PEER"
+        gw="$FEC_GW"; if="$FEC_ALI_IF"; peer="$FEC_TOKYO_PEER"; subnet="172.31.40.0/30"
         echo "=== 切换到 fec 隧道 (RS FEC): $if / $gw ==="
     else
-        gw="$PROD_GW"; if="$PROD_ALI_IF"; peer="$PROD_TOKYO_PEER"
+        gw="$PROD_GW"; if="$PROD_ALI_IF"; peer="$PROD_TOKYO_PEER"; subnet="172.31.30.0/30"
         echo "=== 切换到生产嵌套隧道: $if / $gw ==="
     fi
 
@@ -100,8 +105,8 @@ do_switch() {  # $1 = mode: prod|fec
     echo "--- 切换 ali 策略路由 ---"
     ali_switch "$gw" "$if"
 
-    echo "--- 切换 tokyo 回程路由 ---"
-    tokyo_switch "$peer" "$if"
+    echo "--- 切换 tokyo 回程路由 + 子网伪装 ---"
+    tokyo_switch "$peer" "$if" "$subnet"
 
     echo "--- 更新路由器 routes URL (best effort) ---"
     update_router_url "$gw"
