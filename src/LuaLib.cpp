@@ -343,7 +343,7 @@ static void fec_pipeline_new(lua_State* L) {
 
   // Parse optional fec_stats at index 7 (统计系统, 由 hole.fec_stats 创建)
   if (c >= 7 && lua_isuserdata(L, 7)) {
-    auto* st = *(std::shared_ptr<FecStats>*)luaL_checkudata(L, 7, name_fec_stats);
+    auto st = *(std::shared_ptr<FecStats>*)luaL_checkudata(L, 7, name_fec_stats);
     cfg.stats = st;
     // 注入 stats 到 in/out (Tun / UdpDynMux::Channel)
     if (st) {
@@ -688,7 +688,7 @@ static auto hole_io_object = std::to_array<const struct luaL_Reg>({
     {.name = "fec_shared_state", .func = safe_yield<fec_shared_state_new>},
     {.name = "fec_pipeline", .func = safe_yield<fec_pipeline_new>},
     {.name = "udp_dyn_mux", .func = safe_yield<udp_dyn_mux_new>},
-    {.name = "fec_stats", .func = safe_call<fec_stats_new>},
+    {.name = "fec_stats", .func = safe_yield<fec_stats_new>},
     {.name = NULL, .func = NULL},
 });
 
