@@ -1,6 +1,6 @@
 # Handoff: FEC 统计信息系统 — LLM-CSV 模式 (2026-08-28)
 
-**状态**: Spec 设计阶段(待实现)
+**状态**: ✅ 已实现并上线 (2026-08-29, 生产 fec-test 升级, 部署细节见第十三章)
 **背景**: fec-test 隧道 344 万 rx_dropped(35% 接收)+ 22:04 事件 50% 分片丢失(分钟级 speedtest 暴跌),现有日志无法归因(静默放弃无统计、write 失败无日志、百万级事件无法逐条记日志)
 
 ---
@@ -181,3 +181,67 @@ stats = {
 - CSV 用累计值还是增量值?(建议累计, 分析端差分——避免采样丢失造成的数据缺口)
 - 事件日志是否需要附带环形缓冲摘要?(建议带最近 60s 的 loss/recover 摘要, 一行内)
 - 多接口支持?(当前 fec-test 单接口, 结构预留 iface 维度)
+
+---
+
+## 十三、实施经验教训 (2026-08-29 实测部署后)
+
+### 1. 构建陷阱: CMAKE_BUILD_TYPE 为空 = -O0
+**现象**: 统计二进制 iperf3 只有 41/45M, 生产(8/12 构建)92M, 同配置同路径。
+**根因**: 本项目 CMakeLists 未设 `CMAKE_BUILD_TYPE`, 默认空 → 编译 flags 只有 `-std=c++23`,
+**无优化 (-O0) 且断言启用**。生产二进制是 Release(-O3 -DNDEBUG, 断言被编译掉)。
+RS 编解码热路径 -O0 vs -O3 差 2-3 倍。
+**规则**: 任何部署构建必须显式 `cmake -DCMAKE_BUILD_TYPE=Release .`(验证 flags.make 含 `-O3 -DNDEBUG`)。
+调试构建才有价值: 断言抓到了下面的真实 bug。
+
+### 2. Tun::Write 部分写入 = 生产静默截断路径 (真实丢包来源之一)
+**现象**: 调试构建启动即断言崩溃 `p._Length == bytes_transferred`。
+**根因**: tun 非阻塞写队列满时 `async_write_some` 返回 would_block/部分写入; 原代码 assert 在
+生产 NDEBUG 下失效 → **包尾静默丢弃, 上层以为写成功**。这正是此前无法归因的丢包路径之一。
+**修复**: 循环写到完, would_block 重新注册等可写 edge(EPOLLET 安全), 部分进度计 WritePartial,
+0 进度防御死循环。`EndpointTun.cpp`。
+**教训**: NDEBUG 编译掉 assert 的代码里, "不可能发生"的假设 = 静默损坏。
+
+### 3. 控制包必须只从 encoder(传输侧)发送
+**现象**: CSV `write_fail` 每 60s +100(≈1/s), 且 `rtt_us=0` 永远。
+**根因**: FecPipeline 主循环无条件发 PING/FEEDBACK。decoder 的 _Out 是 tun, 16B 非 IP 控制包
+写 tun → 内核 EINVAL; 且 RTT 回显(pending_feedback_echo)被写进 tun 丢失 → 双向 RTT 测不到。
+**修复**: `if (_IsEncoder && _Shared)` 才发控制包。decoder 仍处理入站控制并计算 RTT。
+**教训**: 两个 pipeline 共享 io_context 但方向不同, 控制面必须绑定传输侧。
+
+### 4. CSV 必须行级 flush
+**现象**: 服务跑 10+ 分钟 CSV 仍 0 字节(表头都没落盘)。
+**根因**: `fopen("a")` 全缓冲 4KB; 原设计每 10 行(10 分钟)flush 一次。
+**修复**: 表头后立即 flush + 每行 flush(60s/行 ~200B, 开销可忽略)。
+**教训**: 统计系统的价值是"崩溃后仍可读最近数据", 缓冲延迟落盘违背目的。
+
+### 5. 测速/验证时 CPU 竞争会污染结果
+**现象**: Release 二进制首测仍 64/54M(编译进程还在后台编 asan 目标抢 CPU)。
+**修复**: 等编译完全结束后重测 → 73/94M, 与生产持平。
+**教训**: 共享 VM 上任何基准测试前先确认无后台编译/高负载。
+
+### 6. SSH 管理环境 (Windows)
+- **必须 `unset SSH_AUTH_SOCK SSH_AGENT_PID`** 再用 `C:\Windows\System32\OpenSSH\ssh.exe`:
+  残留的 Git Bash agent socket 会让 Windows ssh 连不上 Windows agent(有全部 key)。
+- 残留的 Git Bash `ssh-agent` 进程(C:\Program Files\Git\usr\bin)会抢占 `\.\pipe\openssh-ssh-agent`,
+  导致 publickey 被拒 —— 杀掉即可。
+- PowerShell 里 `ssh`/`ssh-add` 默认解析到 Git 版本, 用全路径调 Windows 版。
+- **Ali sudo 密码**: 记录在 `D:\tmp\network-topo\gz\gz-er4-deploy-handover-20260826.md`
+  (`echo '密码' | sudo -S`, 单引号保字面量)。注意: 变量里的管道不重新解析,
+  `PW='echo x | sudo -S'; $PW cmd` 只会 echo —— 必须写完整显式管道。
+
+### 7. 固定 IP 两端用直连, 不用 dyn_mux (用户决策)
+- `hole.udp(port)` + `u:create_channel(peer_host, port)`; **两端都必须绑定固定端口**,
+  Udp channel 按 `IP:port` 精确匹配(EndpointUdp.cpp ReadLoop), 随机源端口会被对端丢弃
+  (表现为"协商没反应"+ 日志 packet from unknown peer)。
+- 直连 vs dyn_mux 性能无差异(对照实验验证), 直连更简单、无 PSK 协商开销。
+
+### 8. 测试隧道部署模式(fec-test2 流程, 已撤销)
+- 新二进制名 `great-hole-fec-test2`、新端口 20087、新 tun 接口 fec-test2、systemd 单元镜像生产。
+- 二进制先停服务再 cp(Text file busy)。
+- 统计 CSV 文件名硬编码 `fec-test-` 前缀 —— 测试与生产共用同一 CSV 文件(ts 可区分)。
+  **后续优化**: 文件名改为 `sys_interface` 前缀, 避免混淆。
+
+### 9. 性能结论
+统计插桩(原子计数 + 60s Tick + 每行 flush)在 Release 下**零性能代价**:
+fec-test2 73/94M vs 生产 81/92M(同轮波动内)。验收标准 3 达成。
