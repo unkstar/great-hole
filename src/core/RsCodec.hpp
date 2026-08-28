@@ -12,6 +12,8 @@
 
 namespace gh {
 
+class FecStats;
+
 // RS (Vandermonde GF256) codec strategy.
 //
 // Source shards are sent immediately (zero batch latency); repairs are
@@ -57,6 +59,7 @@ private:
     std::shared_ptr<FecSharedState> _Shared;
     AdaptiveOverhead* _OverheadCtrl;
     LossPattern* _LossPattern;
+    FecStats* _Stats = nullptr;  // 统计系统 (可空, 由 FecConfig::stats 注入)
     uint64_t _TotalPackets = 0;
     std::chrono::steady_clock::time_point _StartTime = std::chrono::steady_clock::now();
 

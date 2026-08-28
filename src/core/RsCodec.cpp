@@ -8,6 +8,7 @@
 #include <boost/log/trivial.hpp>
 
 #include "AdaptiveOverhead.hpp"
+#include "FecStats.hpp"
 #include "LossPattern.hpp"
 #include "RS256.hpp"
 
@@ -18,7 +19,9 @@ using namespace fec_wire;
 RsCodec::RsCodec(const FecConfig& cfg, bool is_encoder, std::shared_ptr<FecSharedState> shared,
                  AdaptiveOverhead* overhead_ctrl, LossPattern* loss_pattern)
     : _Cfg(cfg), _IsEncoder(is_encoder), _Shared(std::move(shared)),
-      _OverheadCtrl(overhead_ctrl), _LossPattern(loss_pattern) {}
+      _OverheadCtrl(overhead_ctrl), _LossPattern(loss_pattern) {
+    if (_Cfg.stats) _Stats = _Cfg.stats.get();
+}
 
 uint32_t RsCodec::RsSymbolSize(const FecConfig& cfg) {
     uint32_t T = cfg.symbol_size;
@@ -50,6 +53,7 @@ void RsCodec::Tick(std::vector<Packet>& out) {
     if (_IsEncoder) {
         // batch deadline must still fire while the queue is idle
         if (_RsHaveBatch && now - _RsBatchStartTime >= std::chrono::milliseconds(_Cfg.timeout_ms)) {
+            if (_Stats) { _Stats->BatchFlushTimeout(); _Stats->AddBatchSize(_RsBatch.size()); }
             SendRsRepair(_RsBatch, _RsBatchStartSeq);
             _RsBatch.clear();
             _RsHaveBatch = false;
@@ -82,6 +86,7 @@ void RsCodec::UpdateLossRate() {
     const float fail_rate = static_cast<float>(_RsLossFails) / static_cast<float>(_RsLossGroups);
     const float alpha = _Cfg.loss_alpha > 0 ? _Cfg.loss_alpha : 0.1f;
     _Shared->latest_loss_rate = alpha * fail_rate + (1.0f - alpha) * _Shared->latest_loss_rate;
+    if (_Stats) _Stats->SetLossRate(_Shared->latest_loss_rate);
     BOOST_LOG_TRIVIAL(debug) << "RsLossRate: fails=" << _RsLossFails << "/" << _RsLossGroups
                              << " fail_rate=" << fail_rate
                              << " -> rate=" << _Shared->latest_loss_rate;
@@ -100,6 +105,7 @@ void RsCodec::EncodePacket(Packet&& p, std::vector<Packet>& out) {
     // (like the lcrq REPEAT path). seq=0: small shards do NOT consume RS
     // sequence space (RS batch seqs stay contiguous).
     if (dlen + 2 > T || dlen < 256) {
+        if (_Stats) _Stats->EncSmall();
         // redundancy copies: 1 + ceil(repeat_ratio), adapted like lcrq
         float adaptive_ratio = _Cfg.repeat_ratio;
         if (_OverheadCtrl) {
@@ -123,6 +129,7 @@ void RsCodec::EncodePacket(Packet&& p, std::vector<Packet>& out) {
     // RS source shard: send immediately (zero batch delay), accumulate copy for repair
     uint32_t seq = (++_RsSeq) & 0xFFFFFF;
     if (seq == 0) seq = 1;
+    if (_Stats) _Stats->EncSrc();
     {
         Packet op; op._Length = 0;
         op.PushBack(p.Data());
@@ -149,6 +156,11 @@ void RsCodec::EncodePacket(Packet&& p, std::vector<Packet>& out) {
     const bool full = _RsBatch.size() >= _Cfg.max_batch;
     const bool timed_out = (now - _RsBatchStartTime) >= std::chrono::milliseconds(_Cfg.timeout_ms);
     if (full || timed_out) {
+        if (_Stats) {
+            if (full) _Stats->BatchFlushFull();
+            else _Stats->BatchFlushTimeout();
+            _Stats->AddBatchSize(_RsBatch.size());
+        }
         SendRsRepair(_RsBatch, _RsBatchStartSeq);
         _RsBatch.clear();
         _RsHaveBatch = false;
@@ -168,11 +180,16 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
     // the safety margin) and the controller ramps up from there.
     if (_Cfg.loss_deadband >= 0.0f && _Shared &&
         _Shared->peer_loss_rate <= _Cfg.loss_deadband) {
+        if (_Stats) _Stats->DeadbandSuppressed();
         return;
     }
     uint32_t m = static_cast<uint32_t>(std::ceil(k * oh));
     if (m > 255 - k) m = 255 - k;
     if (m == 0) return;
+    if (_Stats) {
+        _Stats->SetOverhead(oh);
+        _Stats->EncRepair(m);
+    }
 
     std::vector<std::vector<uint8_t>> srcv(k, std::vector<uint8_t>(T, 0));
     for (uint32_t i = 0; i < k; i++) {
@@ -214,6 +231,7 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     const uint8_t f = (dw >> 24) & 0xFF;
 
     const bool is_control = (f & kPing) || (f & kFeedback);
+    if (_Stats && is_control) _Stats->DecCtrl();
     if (!is_control && _LossPattern) {
         auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - _StartTime).count();
         if (_LossPattern->ShouldDrop(_TotalPackets, elapsed)) { _TotalPackets++; return; }
@@ -268,8 +286,10 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
         // REPEAT seen check. Duplicate delivery would flood TCP with
         // duplicate ACKs (cwnd collapse) and skew UDP datagram counts.
         const auto* d = p.Data().data();
+        if (_Stats) _Stats->DecSmall();
         if (_HaveLastSmall && _LastSmall.size() == len &&
             std::memcmp(_LastSmall.data(), d, len) == 0) {
+            if (_Stats) _Stats->DecDup();
             return;
         }
         _HaveLastSmall = true;
@@ -295,11 +315,23 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     // shard-granular.
     if (slot.valid) {
         const uint32_t expected = (seq - kRsSrcSlots) & 0xFFFFFF;
-        if (slot.seq != expected) _RsLossFails++;
+        if (slot.seq != expected) {
+            _RsLossFails++;
+            if (_Stats) _Stats->DecMissing();
+        }
         _RsLossGroups++;
     }
     slot.seq = seq;
     slot.valid = true;
+    if (_Stats) _Stats->DecSrc();
+    // 乱序检测: 该分片所属批已恢复完成(repair 先到), 源分片后到 = 乱序误判
+    if (_Stats) {
+        auto& r = _RsRepairs[seq & (kRsRepairSlots - 1)];
+        if (r.valid && r.completed && r.bid <= seq &&
+            seq < static_cast<uint32_t>(r.bid) + r.k) {
+            _Stats->ReorderEarly();
+        }
+    }
     if (slot.payload.size() != T) slot.payload.resize(T);
     slot.payload[0] = static_cast<uint8_t>(len & 0xFF);
     slot.payload[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
@@ -328,6 +360,11 @@ void RsCodec::CleanupStaleBatches(const std::chrono::steady_clock::time_point& n
         auto& r = _RsRepairs[i];
         if (!r.valid) continue;
         if (now - r.time <= std::chrono::milliseconds(_Cfg.decode_timeout_ms)) continue;
+        if (_Stats) {
+            _Stats->DecodeTimeoutCleanup();
+            // 等待超时仍未完成的批 = 静默放弃 (缺失 > repair 能力)
+            if (!r.completed) _Stats->RecoverAbandoned();
+        }
         r.valid = false;
         r.data.clear();
     }
@@ -339,6 +376,7 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k, std::vector<Packet>& out) {
     if (!rep.valid || rep.bid != bid) return;
     if (k == 0 || k > 255) return;
 
+    if (_Stats) _Stats->RecoverAttempt();
     // missing source shards in [bid, bid+k)
     std::vector<uint32_t> missing;
     for (uint32_t s = bid; s < bid + k; s++) {
@@ -379,9 +417,11 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k, std::vector<Packet>& out) {
     std::vector<std::vector<uint8_t>> out_src;
     if (!RS256::Decode(known, T, rows, out_src)) {
         BOOST_LOG_TRIVIAL(warning) << "RsCodec recover failed for batch " << bid;
+        if (_Stats) _Stats->RecoverFailed();
         return;  // keep slot: later shard arrivals retry; outcome counted at release
     }
     BOOST_LOG_TRIVIAL(info) << "RsCodec recovered " << missing.size() << " shards in batch " << bid;
+    if (_Stats) _Stats->RecoverSuccess(static_cast<uint32_t>(missing.size()));
     for (uint32_t s : missing) {
         auto& slot = _RsSrcs[s & (kRsSrcSlots - 1)];
         slot.seq = s;

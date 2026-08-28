@@ -6,6 +6,7 @@
 
 #include "Asio.hpp"
 #include "ErrorCode.hpp"
+#include "FecStats.hpp"
 
 namespace gh {
 
@@ -57,6 +58,19 @@ Omni::Fiber::Coroutine<ErrorCode> Tun::Write(Packet& p, Cancel& c) {
   auto [err, bytes_transferred] = co_await _TunFileDescriptor.async_write_some(
       boost::asio::const_buffer(p),
       boost::asio::bind_cancellation_slot(c.AsioSlot().Slot(), Omni::Fiber::AsioUseFiber));
+  if (_Stats) {
+    if (err) {
+      // EAGAIN = 队列满等待 (不是失败, 但反映压力); 其余错误 = 真实失败
+      if (err == boost::asio::error::would_block ||
+          err == boost::asio::error::try_again) {
+        _Stats->WriteEagain();
+      } else {
+        _Stats->WriteFail(err.value(), p._Length);
+      }
+    } else if (p._Length != bytes_transferred) {
+      _Stats->WritePartial();
+    }
+  }
   assert(p._Length == bytes_transferred);
   co_return err;
 }

@@ -20,6 +20,8 @@
 
 namespace gh {
 
+class FecStats;
+
 class UdpDynMux : public ServiceBase, public ResolveFor {
 public:
   using PskType = UdpDynMuxProto::PskType;
@@ -101,6 +103,9 @@ public:
   Omni::Fiber::Coroutine<ErrorCode> Write(Packet& p, Cancel& c) override;
   Omni::Fiber::Coroutine<ErrorCode> WriteBatch(std::vector<Packet>& pkts, Cancel& c) override;
 
+  // 统计系统注入 (可空, 由 lua stats 配置后调用)
+  void SetStats(FecStats* stats) { _Stats = stats; }
+
 protected:
   std::string GetName() const override;
   Omni::Fiber::Coroutine<ErrorCode> DoStart() override;
@@ -113,6 +118,7 @@ private:
   const uint16_t _LocalRxId = 0;
   uint16_t _RemoteRxId = 0;
   std::shared_ptr<ResolverEndpoint> _PeerResolver;
+  FecStats* _Stats = nullptr;
 
   State _State = State::kNegotiating;
   std::optional<boost::asio::ip::udp::endpoint> _Peer;

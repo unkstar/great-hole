@@ -1,9 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace gh {
+
+class FecStats;
 
 struct FecConfig {
     std::string fec_codec = "lcrq";    // "lcrq" (RFC 6330 RaptorQ, default) | "rs" (Vandermonde GF256)
@@ -37,6 +40,10 @@ struct FecConfig {
     float test_drop_rate = 0.0f;       // primary loss rate parameter
     float test_drop_rate2 = 0.0f;      // secondary parameter (model-dependent)
     uint32_t test_drop_burst = 1;      // burst length / period (model-dependent)
+
+    // 统计系统 (LLM-CSV 模式, 2026-08-28). 可空: 默认 nullptr = 统计关闭,
+    // 不影响现有数据面。由 lua `stats` 配置创建并注入。
+    std::shared_ptr<FecStats> stats;
 };
 
 } // namespace gh
