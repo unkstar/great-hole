@@ -1,5 +1,7 @@
 #include "EndpointUdpDynMux.hpp"
 
+#include "FecStats.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -128,7 +130,8 @@ Omni::Fiber::Coroutine<UdpDynMux::Channel::State> UdpDynMux::Channel::DoWorkRunn
   while (!_Service.value()._Stop.IsTriggered()) {
     auto now = std::chrono::steady_clock::now();
     if (now - _LastSeen > std::chrono::seconds(180)) {
-      BOOST_LOG_TRIVIAL(warning) << GetName() << " session timeout, resetting to negotiating";
+      if (_Stats) { _Stats->MuxSessionTimeout(); _Stats->MuxStateChange(); }
+BOOST_LOG_TRIVIAL(warning) << GetName() << " session timeout, resetting to negotiating";
       _Peer = std::nullopt;
       _RemoteRxId = 0;
       co_return State::kNegotiating;
@@ -260,7 +263,8 @@ UdpDynMux::Channel::HandleControlPacket(boost::asio::ip::udp::endpoint peer, Pac
       bool peerRxMatches = (init->RxId == _RemoteRxId && _Peer == peer);
       _LastSeen = now;
       if (!peerRxMatches) {
-        BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (tx mismatch) from " << peer;
+        if (_Stats) _Stats->MuxStateChange();
+BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (tx mismatch) from " << peer;
         _RemoteRxId = init->RxId;
         _Peer = peer; // peer address is strictly updated only on receiving INITIATE
       } else {
@@ -302,7 +306,8 @@ UdpDynMux::Channel::HandleControlPacket(boost::asio::ip::udp::endpoint peer, Pac
     if (auto err = UdpDynMuxProto::InvalidChannel::Deserialize(packet.Data())) {
       if (_Peer == peer) {
         // upon receiving INVALID_CHANNEL, if peer id and address matches, re kResolving, if not match silent drop
-        BOOST_LOG_TRIVIAL(warning) << GetName() << " received INVALID_CHANNEL, resetting state to negotiating";
+        if (_Stats) { _Stats->MuxInvalidChannel(); _Stats->MuxStateChange(); }
+BOOST_LOG_TRIVIAL(warning) << GetName() << " received INVALID_CHANNEL, resetting state to negotiating";
         _Peer = std::nullopt;
         _RemoteRxId = 0;
         co_return State::kNegotiating;

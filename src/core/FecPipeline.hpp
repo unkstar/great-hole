@@ -13,6 +13,7 @@
 namespace gh {
 
 class AdaptiveOverhead;
+class FecStats;
 class LossPattern;
 
 // Transport layer for FEC. Owns all reads/writes and fiber scheduling; the
@@ -42,6 +43,7 @@ private:
 
     FecConfig _Cfg;
     bool _IsEncoder;
+    FecStats* _Stats = nullptr;  // 统计系统 (可空, FecConfig::stats 注入)
 
     // Adaptive overhead controller (encode side)
     std::unique_ptr<AdaptiveOverhead> _OverheadCtrl;

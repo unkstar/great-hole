@@ -13,6 +13,7 @@
 #include "Asio.hpp"
 #include "Coroutine.hpp"
 #include "ErrorCode.hpp"
+#include "FecStats.hpp"
 #include "GetCurrentFiber.hpp"
 #include "LossPattern.hpp"
 #include "Packet.hpp"
@@ -27,6 +28,7 @@ FecPipeline::FecPipeline(boost::asio::io_context& io, std::shared_ptr<EndpointIn
                          std::shared_ptr<EndpointOutput> out, FecConfig cfg, bool is_encoder,
                          std::shared_ptr<FecSharedState> shared)
     : Pipeline(io, in, filters, out), _Cfg(cfg), _IsEncoder(is_encoder), _Shared(std::move(shared)) {
+    if (_Cfg.stats) _Stats = _Cfg.stats.get();
     if (is_encoder) {
         _OverheadCtrl = AdaptiveOverhead::Create(cfg.algo, cfg.overhead, cfg.max_overhead,
                                                  cfg.safety_margin);
@@ -91,6 +93,7 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                 if (_In->TryRead(p2)) break;  // EAGAIN: fd empty
                 q->push_back(std::move(p2));
             }
+            if (_Stats) _Stats->SetQueueDepthPeak(static_cast<uint32_t>(q->size()));
         }
     });
 
@@ -99,6 +102,14 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
     out.reserve(64);
 
     while (!_Stop.IsTriggered()) {
+        // 统计系统: 周期汇总 (FecStats::Tick 内含事件检测 + CSV + 环形缓冲)
+        if (_Stats) {
+            _Stats->Tick(std::chrono::steady_clock::now());
+            if (_Shared) {
+                _Stats->SetRttUs(_Shared->rtt_ewma_us);
+                _Stats->SetPeerLoss(_Shared->peer_loss_rate);
+            }
+        }
         // PING/FEEDBACK — transport-level control, any time
         if (_Shared) {
             if (_Cfg.ping_interval_ms > 0) {
@@ -121,8 +132,14 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
         out.clear();
         codec->Tick(out);
         if (!out.empty()) {
+            if (_Stats) _Stats->OutBatch(static_cast<uint32_t>(out.size()));
             auto werr = co_await _Out->WriteBatch(out, _Stop);
-            if (werr && IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") write error: " << werr.message(); throw SystemError(werr, "FecPipeline write error"); }
+            if (werr) {
+                // 批中断: 非 critical 错误时 WriteBatch 已提前返回, 剩余包被连带丢弃
+                if (_Stats && !IsCritical(werr))
+                    _Stats->BatchAbort(static_cast<uint32_t>(out.size()));
+                if (IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") write error: " << werr.message(); throw SystemError(werr, "FecPipeline write error"); }
+            }
         }
 
         if (q->empty()) {
@@ -136,8 +153,13 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
         out.clear();
         codec->OnPacket(std::move(p), out);
         if (!out.empty()) {
+            if (_Stats) _Stats->OutBatch(static_cast<uint32_t>(out.size()));
             auto werr = co_await _Out->WriteBatch(out, _Stop);
-            if (werr && IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") write error: " << werr.message(); throw SystemError(werr, "FecPipeline write error"); }
+            if (werr) {
+                if (_Stats && !IsCritical(werr))
+                    _Stats->BatchAbort(static_cast<uint32_t>(out.size()));
+                if (IsCritical(werr)) { BOOST_LOG_TRIVIAL(error) << "FecPipeline(" << this << ") write error: " << werr.message(); throw SystemError(werr, "FecPipeline write error"); }
+            }
         }
     }
     co_return;

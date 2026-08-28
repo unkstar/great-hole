@@ -17,6 +17,7 @@
 #include "Pipeline.hpp"
 #include "FecConfig.hpp"
 #include "FecPipeline.hpp"
+#include "FecStats.hpp"
 #include "ResolverCombinedEndpoint.hpp"
 #include "ResolverHelper.hpp"
 
@@ -61,6 +62,7 @@ constexpr const char name_udp_mux_server[] = "Hole.udp-mux-server";
 constexpr const char name_fec_shared_state[] = "Hole.fec-shared-state";
 constexpr const char name_fec_pipeline[] = "Hole.fec-pipeline";
 constexpr const char name_udp_dyn_mux[] = "Hole.udp-dyn-mux";
+constexpr const char name_fec_stats[] = "Hole.fec-stats";
 
 template <typename T, const char N[]> static int gc(lua_State* L) {
   typedef std::shared_ptr<T> P;
@@ -170,6 +172,48 @@ static auto fec_pipeline_metatable = std::to_array<const struct luaL_Reg>({
     {.name = "stop", .func = safe_yield<fec_pipeline_stop>},
     {.name = NULL, .func = NULL},
 });
+
+// =========================== fec_stats (LLM-CSV 统计系统) ===========================
+static auto fec_stats_metatable = std::to_array<const struct luaL_Reg>({
+    {.name = "__gc", .func = safe_call<gc<FecStats, name_fec_stats>>},
+    {.name = NULL, .func = NULL},
+});
+
+static void fec_stats_new(lua_State* L) {
+  // hole.fec_stats({ enabled=true, interval_ms=60000, csv=true, csv_dir=..., ... })
+  // 返回共享统计实例; 测试配置启用, 生产不创建 (默认 disabled 不影响数据面)
+  FecStatsConfig sc;
+  if (lua_istable(L, 1)) {
+    lua_getfield(L, 1, "enabled");
+    if (lua_isboolean(L, -1)) sc.enabled = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "interval_ms");
+    if (lua_isinteger(L, -1)) sc.interval_ms = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "csv");
+    if (lua_isboolean(L, -1)) sc.csv = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "csv_dir");
+    if (lua_isstring(L, -1)) sc.csv_dir = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "csv_keep_days");
+    if (lua_isinteger(L, -1)) sc.csv_keep_days = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "sys_interface");
+    if (lua_isstring(L, -1)) sc.sys_interface = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "event_log");
+    if (lua_isboolean(L, -1)) sc.event_log = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "ring_buffer_sec");
+    if (lua_isinteger(L, -1)) sc.ring_buffer_sec = (uint32_t)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+  }
+  new (lua_newuserdata(L, sizeof(std::shared_ptr<FecStats>)))
+      std::shared_ptr<FecStats>(std::make_shared<FecStats>(sc));
+  luaL_getmetatable(L, name_fec_stats);
+  lua_setmetatable(L, -2);
+}
 
 static void fec_pipeline_new(lua_State* L) {
   auto c = lua_gettop(L);
@@ -295,6 +339,19 @@ static void fec_pipeline_new(lua_State* L) {
   std::shared_ptr<FecSharedState> shared;
   if (c >= 6 && lua_isuserdata(L, 6)) {
     shared = *(std::shared_ptr<FecSharedState>*)luaL_checkudata(L, 6, name_fec_shared_state);
+  }
+
+  // Parse optional fec_stats at index 7 (统计系统, 由 hole.fec_stats 创建)
+  if (c >= 7 && lua_isuserdata(L, 7)) {
+    auto* st = *(std::shared_ptr<FecStats>*)luaL_checkudata(L, 7, name_fec_stats);
+    cfg.stats = st;
+    // 注入 stats 到 in/out (Tun / UdpDynMux::Channel)
+    if (st) {
+      if (auto* tun = dynamic_cast<Tun*>(in.get())) tun->SetStats(st.get());
+      if (auto* tun = dynamic_cast<Tun*>(out.get())) tun->SetStats(st.get());
+      if (auto* ch = dynamic_cast<UdpDynMux::Channel*>(in.get())) ch->SetStats(st.get());
+      if (auto* ch = dynamic_cast<UdpDynMux::Channel*>(out.get())) ch->SetStats(st.get());
+    }
   }
 
   auto pipe = new (lua_newuserdata(L, sizeof(std::shared_ptr<FecPipeline>)))
@@ -631,6 +688,7 @@ static auto hole_io_object = std::to_array<const struct luaL_Reg>({
     {.name = "fec_shared_state", .func = safe_yield<fec_shared_state_new>},
     {.name = "fec_pipeline", .func = safe_yield<fec_pipeline_new>},
     {.name = "udp_dyn_mux", .func = safe_yield<udp_dyn_mux_new>},
+    {.name = "fec_stats", .func = safe_call<fec_stats_new>},
     {.name = NULL, .func = NULL},
 });
 
@@ -689,6 +747,12 @@ static int hole_open(lua_State* L) {
   lua_pushvalue(L, -1);
   lua_setfield(L, -2, "__index");
   luaL_setfuncs(L, fec_shared_state_metatable.data(), 0);
+  lua_pop(L, 1);
+
+  luaL_newmetatable(L, name_fec_stats);
+  lua_pushvalue(L, -1);
+  lua_setfield(L, -2, "__index");
+  luaL_setfuncs(L, fec_stats_metatable.data(), 0);
   lua_pop(L, 1);
 
   luaL_newmetatable(L, name_filter);
