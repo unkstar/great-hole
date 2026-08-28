@@ -179,7 +179,7 @@ static auto fec_stats_metatable = std::to_array<const struct luaL_Reg>({
     {.name = NULL, .func = NULL},
 });
 
-static void fec_stats_new(lua_State* L) {
+static int fec_stats_new(lua_State* L) {
   // hole.fec_stats({ enabled=true, interval_ms=60000, csv=true, csv_dir=..., ... })
   // 返回共享统计实例; 测试配置启用, 生产不创建 (默认 disabled 不影响数据面)
   FecStatsConfig sc;
@@ -213,6 +213,7 @@ static void fec_stats_new(lua_State* L) {
       std::shared_ptr<FecStats>(std::make_shared<FecStats>(sc));
   luaL_getmetatable(L, name_fec_stats);
   lua_setmetatable(L, -2);
+  return 1;
 }
 
 static void fec_pipeline_new(lua_State* L) {
@@ -688,7 +689,7 @@ static auto hole_io_object = std::to_array<const struct luaL_Reg>({
     {.name = "fec_shared_state", .func = safe_yield<fec_shared_state_new>},
     {.name = "fec_pipeline", .func = safe_yield<fec_pipeline_new>},
     {.name = "udp_dyn_mux", .func = safe_yield<udp_dyn_mux_new>},
-    {.name = "fec_stats", .func = safe_yield<fec_stats_new>},
+    {.name = "fec_stats", .func = safe_call<fec_stats_new>},
     {.name = NULL, .func = NULL},
 });
 
