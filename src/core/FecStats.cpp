@@ -158,7 +158,10 @@ void FecStats::CleanupOldCsv() {
         auto now = std::chrono::system_clock::now();
         for (auto& entry : fs::directory_iterator(_Cfg.csv_dir)) {
             auto ft = fs::last_write_time(entry.path());
-            auto age = std::chrono::duration_cast<std::chrono::hours>(now - ft).count();
+            // fs::file_time_type 基于 file_clock, 需显式转换到 system_clock 再相减
+            auto age = std::chrono::duration_cast<std::chrono::hours>(
+                           std::chrono::file_clock::to_sys(ft) - now)
+                           .count();
             if (age > static_cast<std::int64_t>(_Cfg.csv_keep_days * 24)) {
                 fs::remove(entry.path());
             }
@@ -174,10 +177,11 @@ void FecStats::AppendCsv() {
         "%lld,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
         ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
         ",%" PRIu64 ",%.4f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
-        ",%.4f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.1f,%" PRIu64 ",%" PRIu64
-        ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%.1f,%" PRIu64 ",%.4f,%" PRIu64
+        ",%.4f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.1f,%" PRIu64
+        ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%u,%.1f
+        ,%" PRIu64 ",%.4f,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
         ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
-        ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%.1f\n",
+        ",%" PRIu64 ",%.1f\n",
         static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::system_clock::now().time_since_epoch()).count()),
         _DecSrc.load(), _DecMissing.load(), _DecSmall.load(), _DecCtrl.load(), _DecDup.load(),
