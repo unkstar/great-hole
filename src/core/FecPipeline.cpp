@@ -110,8 +110,12 @@ Omni::Fiber::Coroutine<void> FecPipeline::Process() {
                 _Stats->SetPeerLoss(_Shared->peer_loss_rate);
             }
         }
-        // PING/FEEDBACK — transport-level control, any time
-        if (_Shared) {
+        // PING/FEEDBACK — transport-level control. 只在传输侧 (encoder, out=UDP
+        // channel) 发送: decoder 的 out=tun, 控制包 (16B 非 IP) 写 tun 会被内核以
+        // EINVAL 拒绝 — 每 ping_interval 一次 write_fail, 且 RTT 回显
+        // (pending_feedback_echo) 永远送不出去 (2026-08-29 fec-test2 CSV:
+        // wfail 持续增长 + rtt_us=0)
+        if (_IsEncoder && _Shared) {
             if (_Cfg.ping_interval_ms > 0) {
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - _LastPingTime).count();
