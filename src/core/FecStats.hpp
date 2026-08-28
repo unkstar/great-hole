@@ -60,7 +60,7 @@ public:
     // ---- FEC 编码侧 ----
     void EncSrc() { _EncSrc.fetch_add(1, std::memory_order_relaxed); }
     void EncSmall() { _EncSmall.fetch_add(1, std::memory_order_relaxed); }
-    void EncRepair() { _EncRepair.fetch_add(1, std::memory_order_relaxed); }
+    void EncRepair(uint32_t n) { _EncRepair.fetch_add(n, std::memory_order_relaxed); }
     void DeadbandSuppressed() { _DeadbandSuppressed.fetch_add(1, std::memory_order_relaxed); }
     void SetOverhead(float oh) { _Overhead.store(oh, std::memory_order_relaxed); }
     void OverheadMaxHit() { _OverheadMaxHits.fetch_add(1, std::memory_order_relaxed); }
