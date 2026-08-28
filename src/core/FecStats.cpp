@@ -149,6 +149,7 @@ void FecStats::OpenCsv() {
             "out_batch_avg,rtt_us,peer_loss,ping_timeout,feedback_timeout,"
             "mux_state_changes,mux_invalid_channel,mux_session_timeout,"
             "sys_rx_pkts,sys_rx_dropped,sys_tx_pkts,sys_tx_dropped,vm_rss_kb,mem_avail_kb,cpu_pct\n");
+        std::fflush(_CsvFile);
     }
 }
 
@@ -205,12 +206,11 @@ void FecStats::AppendCsv() {
         _SysRxPkts, _SysRxDropped, _SysTxPkts, _SysTxDropped,
         _SysVmRssKb, _SysMemAvailKb, _SysCpuPct);
     _CsvRows++;
-    if (_CsvRows % 10 == 0) {
-        if (std::fflush(_CsvFile) != 0) {
-            _DiskError++;
-            if (_DiskError == 1)
-                BOOST_LOG_TRIVIAL(warning) << "FecStats: csv flush failed (disk full?)";
-        }
+    // 60s/行 频率: 每行落盘, 崩溃/重启不丢最近数据 (LLM-CSV 可追溯性要求)
+    if (std::fflush(_CsvFile) != 0) {
+        _DiskError++;
+        if (_DiskError == 1)
+            BOOST_LOG_TRIVIAL(warning) << "FecStats: csv flush failed (disk full?)";
     }
 }
 
