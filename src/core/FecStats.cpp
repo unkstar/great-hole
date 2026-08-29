@@ -63,6 +63,15 @@ void FecStats::SampleSystem() {
     _SysRxDropped = ReadU64((base + "rx_dropped").c_str());
     _SysTxPkts = ReadU64((base + "tx_packets").c_str());
     _SysTxDropped = ReadU64((base + "tx_dropped").c_str());
+    if (_SysFirst) {
+        // 首次采样: 接口计数是历史累计 (进程重启不归零), 直接建立基线,
+        // 否则 CheckEvents/UpdateRing 会把全部历史当增量 -> 假阳性报警
+        // (2026-08-29 实测: 升级重启后误报 rx_dropped 3474539/11104421 (31%))
+        _SysRxPktsPrev = _SysRxPkts;
+        _SysRxDroppedPrev = _SysRxDropped;
+        _SysTxPktsPrev = _SysTxPkts;
+        _SysTxDroppedPrev = _SysTxDropped;
+    }
 
     // 进程 RSS (/proc/self/status VmRSS)
     {
