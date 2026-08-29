@@ -101,7 +101,7 @@ private:
     void EncodePacket(Packet&& p, std::vector<Packet>& out);
     void SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_start_seq);
     void DecodePacket(Packet&& p, std::vector<Packet>& out);
-    void CleanupStaleBatches(const std::chrono::steady_clock::time_point& now);
+    void CleanupStaleBatches(const std::chrono::steady_clock::time_point& now, std::vector<Packet>& out);
     void RsTryRecover(uint32_t bid, uint32_t k, std::vector<Packet>& out);
 };
 
