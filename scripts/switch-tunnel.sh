@@ -18,6 +18,9 @@
 set -euo pipefail
 
 MODE="${1:-status}"
+# 模式状态文件 (两端同路径): up/down 脚本据此决定是否配置出口路由。
+# 单一事实来源 — 防止服务重启/机器重启后出口被无条件改回嵌套隧道 (2026-08-29 事故)。
+MODE_FILE="/etc/great-hole/fec/tunnel-mode"
 ALI_HOST="unkstar@39.108.136.48"
 TOKYO_SSH=(ssh -o BatchMode=yes -o PasswordAuthentication=no -p 63916 "ggcuser@202.144.195.103")
 ALI_SSH=(ssh -o BatchMode=yes -o PasswordAuthentication=no "$ALI_HOST")
@@ -114,11 +117,21 @@ do_switch() {  # $1 = mode: prod|fec
     echo "--- 更新路由器 routes URL (best effort) ---"
     update_router_url "$gw"
 
+    echo "--- 持久化模式状态 ($mode) ---"
+    ali_root <<EOF
+printf '%s\n' '${mode}' > ${MODE_FILE}
+EOF
+    "${TOKYO_SSH[@]}" "sudo sh -c 'printf \"%s\\n\" \"$mode\" > ${MODE_FILE}'"
+
     echo "--- 切换完成, 当前状态 ---"
     show_status
 }
 
 show_status() {
+    local m
+    m="$(ssh -o BatchMode=yes -o PasswordAuthentication=no -o ConnectTimeout=5 "$ALI_HOST" \
+        "cat ${MODE_FILE} 2>/dev/null || echo '(unset, 默认 prod)'" 2>/dev/null)"
+    echo "当前模式: ${m} (${MODE_FILE})"
     echo "ali ip rule (ER-X):"
     ssh -o BatchMode=yes -o PasswordAuthentication=no -o ConnectTimeout=5 "$ALI_HOST" \
         "ip rule | grep 'from ${ERX_IP}' || echo '  (none)'" 2>/dev/null
