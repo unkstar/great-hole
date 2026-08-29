@@ -68,7 +68,7 @@ void RsCodec::Tick(std::vector<Packet>& out) {
         }
     } else {
         UpdateLossRate();
-        CleanupStaleBatches(now);
+        CleanupStaleBatches(now, out);
     }
 }
 
@@ -352,7 +352,7 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     out.push_back(std::move(op));
 }
 
-void RsCodec::CleanupStaleBatches(const std::chrono::steady_clock::time_point& now) {
+void RsCodec::CleanupStaleBatches(const std::chrono::steady_clock::time_point& now, std::vector<Packet>& out) {
     // Repair slot release. Loss accounting no longer lives here: it is
     // shard-granular at source-slot eviction (DecodePacket), so it keeps
     // working while loss_deadband suppresses repairs.
