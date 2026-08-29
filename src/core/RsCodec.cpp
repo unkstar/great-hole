@@ -359,7 +359,15 @@ void RsCodec::CleanupStaleBatches(const std::chrono::steady_clock::time_point& n
     for (uint32_t i = 0; i < kRsRepairSlots; i++) {
         auto& r = _RsRepairs[i];
         if (!r.valid) continue;
-        if (now - r.time <= std::chrono::milliseconds(_Cfg.decode_timeout_ms)) continue;
+        if (now - r.time <= std::chrono::milliseconds(_Cfg.decode_timeout_ms)) {
+            // 周期重试: repair 先于源包到达 (网络乱序/延迟) 时, 首次尝试会因
+            // missing>available 而等待, 源包随后到达却不再触发重试 (旧逻辑只在
+            // seq≡bid (mod 256) 时碰巧命中 — 2026-08-29 实测恢复成功率 0.13%,
+            // Decode 从不失败 = 恢复根本没被触发)。主循环每 100μs 扫到这里,
+            // 对未完成批周期性重试, 恢复不再依赖到达顺序。
+            if (!r.completed) RsTryRecover(r.bid, r.k, out);
+            continue;
+        }
         if (_Stats) {
             _Stats->DecodeTimeoutCleanup();
             // 等待超时仍未完成的批 = 静默放弃 (缺失 > repair 能力)
@@ -376,7 +384,6 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k, std::vector<Packet>& out) {
     if (!rep.valid || rep.bid != bid) return;
     if (k == 0 || k > 255) return;
 
-    if (_Stats) _Stats->RecoverAttempt();
     // missing source shards in [bid, bid+k)
     std::vector<uint32_t> missing;
     for (uint32_t s = bid; s < bid + k; s++) {
@@ -393,6 +400,10 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k, std::vector<Packet>& out) {
     size_t repairs_available = 0;
     for (const uint8_t m : rep.mask) repairs_available += std::popcount(m);
     if (missing.size() > repairs_available) return;  // wait for more repairs
+
+    // 计数点移到真正开始恢复处: 周期重试 (CleanupStaleBatches) 会让"等待"阶段的
+    // 调用大量重复, 在此计 attempt 才能反映真实解码尝试次数
+    if (_Stats) _Stats->RecoverAttempt();
 
     // assemble known shards: source unit rows + repair Vandermonde rows
     std::vector<std::vector<uint8_t>> known, rows;
