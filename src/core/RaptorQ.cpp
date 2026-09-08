@@ -55,6 +55,16 @@ uint8_t* RaptorQ::GenerateSymbol(uint32_t esi) {
     return sym;
 }
 
+bool RaptorQ::GenerateSymbol(uint32_t esi, uint8_t* out_buf) {
+    if (!_encoded) {
+        throw std::logic_error("RaptorQ: must call Encode() before GenerateSymbol()");
+    }
+    auto* rq = static_cast<rq_t*>(_rq);
+    rq_pid_t pid = rq_pidset(0, esi);
+    auto* result = rq_symbol(rq, &pid, out_buf, 0);
+    return result != nullptr;
+}
+
 void RaptorQ::SubmitSymbol(const uint8_t* symbol, size_t symbol_len, uint32_t esi) {
     if (symbol_len != _T) {
         throw std::invalid_argument("RaptorQ: symbol size mismatch, expected " + std::to_string(_T)

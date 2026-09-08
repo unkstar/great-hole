@@ -23,3 +23,10 @@ target_link_libraries(lcrq_test PRIVATE great-hole-core-asan lcrq GTest::gtest_m
 target_compile_options(lcrq_test PRIVATE -fsanitize=address -fno-omit-frame-pointer)
 target_link_options(lcrq_test PRIVATE -fsanitize=address)
 gtest_discover_tests(lcrq_test)
+
+add_executable(rs_test TestRs.cpp)
+target_link_libraries(rs_test PRIVATE great-hole-core-asan GTest::gtest_main)
+
+target_compile_options(rs_test PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+target_link_options(rs_test PRIVATE -fsanitize=address)
+gtest_discover_tests(rs_test)

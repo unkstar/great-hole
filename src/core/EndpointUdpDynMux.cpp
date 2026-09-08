@@ -1,5 +1,7 @@
 #include "EndpointUdpDynMux.hpp"
 
+#include "FecStats.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -128,7 +130,8 @@ Omni::Fiber::Coroutine<UdpDynMux::Channel::State> UdpDynMux::Channel::DoWorkRunn
   while (!_Service.value()._Stop.IsTriggered()) {
     auto now = std::chrono::steady_clock::now();
     if (now - _LastSeen > std::chrono::seconds(180)) {
-      BOOST_LOG_TRIVIAL(warning) << GetName() << " session timeout, resetting to negotiating";
+      if (_Stats) { _Stats->MuxSessionTimeout(); _Stats->MuxStateChange(); }
+BOOST_LOG_TRIVIAL(warning) << GetName() << " session timeout, resetting to negotiating";
       _Peer = std::nullopt;
       _RemoteRxId = 0;
       co_return State::kNegotiating;
@@ -214,6 +217,39 @@ Omni::Fiber::Coroutine<ErrorCode> UdpDynMux::Channel::Write(Packet& p, Cancel& c
 
   co_return co_await _Parent.WriteTo(_Peer.value(), p, c);
 }
+Omni::Fiber::Coroutine<ErrorCode> UdpDynMux::Channel::WriteBatch(std::vector<Packet>& pkts, Cancel& c) {
+  if (c.IsTriggered() || ServiceBase::_State != ServiceBase::State::kRunning)
+    co_return ErrorCode{AppErrorCategory::kOperationAborted, kAppError};
+  if (_State != State::kRunning)
+    co_return ErrorCode{AppErrorCategory::kInvalidPacketSession, kAppError};
+  if (!_Peer.has_value() || _RemoteRxId == 0)
+    co_return ErrorCode{AppErrorCategory::kInvalidPacketSession, kAppError};
+  if (pkts.empty()) co_return ErrorCode{};
+  // Send pacing: optional minimum inter-datagram gap in µs (0 = off).
+  // Pacing flattens transient bursts (UDPspeeder -j spirit) that trigger
+  // drops in intermediate devices. Costs one timer await per packet; keep
+  // 0 unless burst loss is actually observed on the path.
+  static constexpr uint32_t kSendPacingUs = 0;
+  for (auto& p : pkts) {
+    if (p._Offset < 2) continue;
+    p.PushFront(_RemoteRxId);
+    auto [err, n] = co_await _Parent._Socket.async_send_to(
+        boost::asio::const_buffer(p), _Peer.value(),
+        boost::asio::bind_cancellation_slot(c.AsioSlot().Slot(), Omni::Fiber::AsioUseFiber));
+    if (err) {
+      if (err == boost::asio::error::operation_aborted)
+        co_return ErrorCode{AppErrorCategory::kOperationAborted, kAppError};
+      co_return ErrorCode(err.value(), system_category());
+    }
+    if (kSendPacingUs > 0) {
+      boost::asio::steady_timer timer(_Parent._Socket.get_executor());
+      timer.expires_after(std::chrono::microseconds(kSendPacingUs));
+      co_await timer.async_wait(boost::asio::bind_cancellation_slot(
+          c.AsioSlot().Slot(), Omni::Fiber::AsioUseFiber));
+    }
+  }
+  co_return ErrorCode{};
+}
 
 Omni::Fiber::Coroutine<UdpDynMux::Channel::State>
 UdpDynMux::Channel::HandleControlPacket(boost::asio::ip::udp::endpoint peer, Packet& packet) {
@@ -227,19 +263,27 @@ UdpDynMux::Channel::HandleControlPacket(boost::asio::ip::udp::endpoint peer, Pac
       bool peerRxMatches = (init->RxId == _RemoteRxId && _Peer == peer);
       _LastSeen = now;
       if (!peerRxMatches) {
-        BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (tx mismatch) from " << peer;
+        if (_Stats) _Stats->MuxStateChange();
+BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (tx mismatch) from " << peer;
         _RemoteRxId = init->RxId;
         _Peer = peer; // peer address is strictly updated only on receiving INITIATE
       } else {
         BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (tx matched) from " << peer;
       }
 
-      if (!myRxMatches) {
-        BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (my rx mismatch) sending initiate to " << peer;
+      // Reply only while still converging. PeerRxId propagation is one-way:
+      // only the sender of an initiate carries its view of the peer's RxId, so
+      // the side whose PeerRxId is stale must reply to converge. But replying
+      // UNCONDITIONALLY (even once fully matched) feeds a self-sustaining
+      // initiate ping-pong between the two sides — each reply triggers the
+      // peer's reply forever (~34 pkt/s observed). Once both PeerRxIds match,
+      // neither side needs to send; a later mismatch (peer restart) sets
+      // peerRxMatches false and resumes replying.
+      BOOST_LOG_TRIVIAL(info) << GetName() << " received initiate (my rx " << (myRxMatches ? "matched" : "mismatch") << ") from " << peer;
+      if (!myRxMatches || !peerRxMatches) {
         co_await _Parent.SendControlInitiate(peer, init->Psk, _LocalRxId, _RemoteRxId);
       }
-
-      co_return State::kRunning;
+      co_return myRxMatches ? State::kRunning : State::kNegotiating;
     }
   } else if (msgType == static_cast<uint8_t>(UdpDynMuxProto::MsgType::kKeepalive)) {
     if (auto ping = UdpDynMuxProto::Keepalive::Deserialize(packet.Data())) {
@@ -262,7 +306,8 @@ UdpDynMux::Channel::HandleControlPacket(boost::asio::ip::udp::endpoint peer, Pac
     if (auto err = UdpDynMuxProto::InvalidChannel::Deserialize(packet.Data())) {
       if (_Peer == peer) {
         // upon receiving INVALID_CHANNEL, if peer id and address matches, re kResolving, if not match silent drop
-        BOOST_LOG_TRIVIAL(warning) << GetName() << " received INVALID_CHANNEL, resetting state to negotiating";
+        if (_Stats) { _Stats->MuxInvalidChannel(); _Stats->MuxStateChange(); }
+BOOST_LOG_TRIVIAL(warning) << GetName() << " received INVALID_CHANNEL, resetting state to negotiating";
         _Peer = std::nullopt;
         _RemoteRxId = 0;
         co_return State::kNegotiating;
@@ -294,6 +339,8 @@ Omni::Fiber::Coroutine<ErrorCode> UdpDynMux::DoStart() {
     _Socket.open(boost::asio::ip::udp::v6());
     _Socket.set_option(boost::asio::ip::v6_only(false));
     _Socket.bind(_Local);
+  _Socket.set_option(boost::asio::socket_base::send_buffer_size(4 * 1024 * 1024));
+  _Socket.set_option(boost::asio::socket_base::receive_buffer_size(4 * 1024 * 1024));
     _Local = _Socket.local_endpoint();
     BOOST_LOG_TRIVIAL(info) << GetName() << " bound at " << _Local;
   } catch (const SystemError& e) {

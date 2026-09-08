@@ -1,14 +1,21 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <string>
 
 namespace gh {
 
+class FecStats;
+
 struct FecConfig {
+    std::string fec_codec = "lcrq";    // "lcrq" (RFC 6330 RaptorQ, default) | "rs" (Vandermonde GF256)
     uint32_t timeout_ms = 4;           // batch maximum wait time (min 1)
     float overhead = 0.15f;            // initial redundancy ratio
     float max_overhead = 0.50f;        // adaptive overhead upper limit
-    float repeat_ratio = 4.0f;         // single-packet REPEAT multiplier = 1+ceil(ratio)
+    float repeat_ratio = 4.0f;         // initial single-pkt REPEAT: copies=1+ceil(ratio)
+    float repeat_ratio_min = 1.0f;     // min REPEAT ratio (lowest copies=2)
+    float repeat_ratio_max = 5.0f;     // max REPEAT ratio (highest copies=6)
     uint32_t symbol_size = 0;          // RaptorQ symbol size, 0 = auto-calculate from MTU
     uint32_t mtu = 1500;               // used for symbol_size calculation
     uint32_t max_batch = 200;          // symbol_count upper limit
@@ -20,6 +27,23 @@ struct FecConfig {
     uint32_t feedback_stale_ms = 10000;   // no-feedback fallback overhead timeout
     uint32_t ping_loss_threshold = 5;     // consecutive PING loss threshold
     uint32_t decode_timeout_ms = 200;     // initial decode timeout (RTT-calibrated override)
+
+    // Adaptive overhead algorithm selection
+    uint8_t algo = 1;                  // algorithm 0~7 (see fec-spec.md)
+    uint32_t loss_window_groups = 50;  // groups per loss-rate update (~500ms-1s)
+    float loss_alpha = 0.1f;           // IIR smoothing factor for loss rate
+    float safety_margin = 0.01f;       // minimum overhead floor for adaptive algos
+    float loss_deadband = -1.0f;       // -1=disabled; >=0: send no repair while measured loss <= value
+
+    // Controllable packet loss for testing
+    uint8_t test_drop_pattern = 0;     // loss model 0~6 (0=disabled)
+    float test_drop_rate = 0.0f;       // primary loss rate parameter
+    float test_drop_rate2 = 0.0f;      // secondary parameter (model-dependent)
+    uint32_t test_drop_burst = 1;      // burst length / period (model-dependent)
+
+    // 统计系统 (LLM-CSV 模式, 2026-08-28). 可空: 默认 nullptr = 统计关闭,
+    // 不影响现有数据面。由 lua `stats` 配置创建并注入。
+    std::shared_ptr<FecStats> stats;
 };
 
 } // namespace gh

@@ -2,8 +2,9 @@
 
 ## Status
 
-Draft — 基于 UDPspeeder 调研和 great-hole 代码分析，design 阶段。
-FEC 作为 Pipeline 的可配置功能，全部 PushFront，header 位于端点头与 IV+XORed payload 之间。
+**Implemented & Tested** — 全部 Phase 1-4 代码实现完成，Phase 5-7 矩阵测试通过（192/192, 0 失败）。
+8 种自适应算法在 100Mbps/100msRTT 下完成功能验证，PI 确认为最佳自适应算法。
+**RS Codec 主线完成 (2026-08-08)** — Vandermonde GF256 编码器上线 fec-test 隧道: TCP dl 88.5M / ul 65.2M (vs lcrq 16M), UDP 双向 0%, 补偿率 5.0%。详见文末 "RS 实测终态"。
 
 ## References
 
@@ -322,16 +323,389 @@ PING 包携带发送时间戳 (payload 字段)。接收方收到后，将 `send_
 
 - 收方每 decode 一个 group → `feedback = uint8_t(loss_rate × 250)` (clamp 250)
 - 写入包中 feedback 字段
-- 发方收到后：`ewma = α × new_loss + (1-α) × ewma` (α=0.3)
-- 实际 overhead = `min(ewma/(1-ewma) + safety_margin, max_overhead)`
+- 发方收到后交给 `AdaptiveOverhead` 控制器处理
+- `FecConfig` 新增 `algo` 字段选择算法
 
-### 自适应 overhead
+### 自适应 overhead 算法
 
-| 丢包率 p | overhead = p/(1-p) | +5% 安全 |
-|:---:|:---:|:---:|
-| 10% | 11.1% | 16.1% |
-| 15% | 17.6% | 22.6% |
-| 20% | 25.0% | 30.0% |
+RaptorQ 理论最小开销：给定丢包率 p，需 overhead ≥ p/(1-p) 才能恢复。
+实际需加安全余量以覆盖：有限 block 的方差、丢包突发、RTT 反馈延迟。
+
+以下列出全部候选算法，待实现后通过可控丢包测试（`test_drop_rate` 选项）对比选择。
+
+---
+
+#### 算法 0: Static（静态固定值）★ 当前实现
+
+**原理**：不自适应，始终使用初始 `overhead` 值。
+
+```
+overhead = cfg.overhead  // 固定
+```
+
+**优点**：最简单，零计算开销。
+**缺点**：无法响应链路变化，要么浪费带宽要么保护不足。
+**用途**：作为 baseline 对照。
+
+---
+
+#### 算法 1: EWMA + Static Safety（带静态安全余量的指数平滑）★ 当前实现
+
+**原理**：EWMA 平滑丢包率，加固定安全余量。
+
+```
+L_ewma[t] = α * L_sample + (1-α) * L_ewma[t-1]
+overhead  = L_ewma / (1 - L_ewma) + safety_margin
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `alpha` | 0.3 | EWMA 平滑因子，越大反应越快但越抖 |
+| `safety_margin` | 0.05 | 固定安全余量 5% |
+
+**理论依据**：`p/(1-p)` 是无限 block size 下 Shannon 下界（3GPP TR 26.822）。
+有限 K 需要额外余量（K=20 需 45%，K=100 需 24%，vs 理论 11.1%）。
+
+**优点**：实现简单，平滑稳定。
+**缺点**：反应滞后于丢包突变，安全余量不随 block 大小变化。
+
+---
+
+#### 算法 2: EWMA + Dynamic Safety（带动态安全余量的指数平滑）
+
+**原理**：安全余量随丢包率波动自动缩放。
+
+```
+L_ewma[t]  = α * L_sample + (1-α) * L_ewma[t-1]
+σ²[t]      = β * (L_sample - L_ewma)² + (1-β) * σ²[t-1]
+safety     = safety_base + γ * sqrt(σ²)
+overhead   = L_ewma / (1 - L_ewma) + safety
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `alpha` | 0.3 | EWMA 平滑因子 |
+| `beta` | 0.2 | 方差平滑因子 |
+| `safety_base` | 0.03 | 基础安全余量 |
+| `gamma` | 2.0 | 波动放大系数 |
+
+**理论依据**：当丢包率稳定时方差小 → 安全余量接近 safety_base，节省带宽。
+当丢包率剧烈波动时方差大 → 安全余量自动扩大，应对突变。
+
+**优点**：自动适应链路稳定性，优于固定余量。
+**缺点**：增加一个平滑参数，调参略复杂。
+
+---
+
+#### 算法 3: PI Controller（比例-积分控制）
+
+**原理**：经典控制论，以目标丢包率为 setpoint。
+
+```
+error     = L_target - L_measured     // 目标丢包 0，实际丢包 >0 则 error <0
+integral  = clamp(integral + error * dt, -0.3, 0.3)  // 防积分饱和
+overhead  = Kp * (-error) + Ki * integral
+overhead  = clamp(overhead, 0.01, max_overhead)
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `Kp` | 1.5 | 比例增益 |
+| `Ki` | 0.8 | 积分增益 |
+| `L_target` | 0.01 | 目标丢包率（不为 0 避免永久补偿）|
+
+**理论依据**：PID-FEC 机制（IJES 2019），Ziegler-Nichols 整定 Kp=1.52, Ki=1.43。
+PI（去掉微分项）在测量噪声大时更鲁棒（INFOCOM 2017 PIA 控制器）。
+
+**优点**：控制理论完备，稳态误差可消除，业界验证。
+**缺点**：参数需整定，积分饱和需处理。
+
+---
+
+#### 算法 4: MIMD（乘性增加/乘性减少）
+
+**原理**：解码失败→快速乘性增加，解码成功→缓慢乘性减少。
+
+```
+if decode_failed:
+    overhead *= (1 + λ_up)      // 快速拉起
+elif consecutive_success > N_stable:
+    overhead *= (1 - λ_down)    // 缓慢回落
+overhead = clamp(overhead, min_overhead, max_overhead)
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `lambda_up` | 0.50 | 失败时增加 50% |
+| `lambda_down` | 0.05 | 成功时减少 5% |
+| `N_stable` | 20 | 连续成功多少个 group 后才开始降 |
+
+**理论依据**：类似 TCP 的 AIMD 但用乘法提速。RaptorQ 的 rateless 特性使得 overhead=0 也有 99.6% 成功率（p≤1% 时），因此 MIMD 可安全收敛到极小值。
+
+**优点**：反应极快（丢包尖峰立刻拉高），稳态 overhead 自动收敛到最低值。
+**缺点**：可能 overshoot（峰值 overhead 偏高），需 min_overhead 防止过低。
+
+---
+
+#### 算法 5: Quantile Target（分位数目标）
+
+**原理**：用 P95/P99 丢包率代替均值，覆盖尖峰。
+
+```
+loss_window = queue<最近 N 个 group 的丢包率>
+L_target    = percentile(loss_window, pct)  // 如 P95
+overhead    = L_target / (1 - L_target) + safety_margin
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `window_size` | 64 | 滑动窗口 group 数 |
+| `percentile` | 95 | 目标分位数 (90/95/99) |
+| `safety_margin` | 0.03 | 在小分位数之上再加余量 |
+
+**理论依据**：均值对丢包尖峰不敏感；P95 可覆盖 95% 的场景，避免为偶发尖峰过度补偿。
+配合 RaptorQ rateless 特性，单次尖峰超出 overhead 时仅丢一个 group，影响可控。
+
+**优点**：天然抗尖峰，不因偶发大丢包而过度反应。
+**缺点**：窗口大小和分位数的选择需要经验调优。
+
+---
+
+#### 算法 6: Burst-Aware EWMA（突发感知指数平滑）
+
+**原理**：区分背景丢包和突发丢包，分开统计。
+
+```
+if L_sample > L_ewma + burst_threshold:
+    // 检测到突发
+    L_burst[t] = α_fast * L_sample + (1-α_fast) * L_burst[t-1]
+else:
+    L_burst[t] = α_slow * L_burst[t-1]  // 缓慢衰减
+L_bg[t]     = α_slow * L_sample + (1-α_slow) * L_bg[t-1]
+overhead    = max(L_bg / (1-L_bg), L_burst / (1-L_burst)) + safety
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `alpha_slow` | 0.1 | 背景丢包平滑（慢） |
+| `alpha_fast` | 0.6 | 突发丢包平滑（快） |
+| `burst_threshold` | 0.05 | 超过 EWMA 多少判定为突发 |
+
+**理论依据**：Gilbert 信道模型 — 丢包不是独立同分布，有"好状态"和"坏状态"。
+分状态跟踪可避免突发结束后 overhead 回落过慢。
+
+**优点**：对真实链路（含突发丢包）效果最好。
+**缺点**：两个状态 + 阈值判断，实现稍复杂。
+
+---
+
+#### 算法 7: Gradient Throughput Optimization（梯度下降吞吐优化）
+
+**原理**：直接优化目标函数 `throughput = (1-overhead) * (1-loss_rate)`。
+
+```
+// 观测: 上次 overhead 产生的实际 throughput
+T_prev = (1 - overhead_prev) * (1 - L_measured)
+// 微调 overhead，观测 throughput 变化
+overhead_try = overhead_prev + δ
+// 下一次测得的 throughput
+T_try  = (1 - overhead_try) * (1 - L_new)
+// 梯度方向
+if T_try > T_prev:
+    overhead = overhead_try          // 同方向继续
+else:
+    overhead = overhead_prev - δ    // 反向
+```
+
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `delta` | 0.02 | 微调步长 |
+| `eval_interval` | 500ms | 评估间隔 |
+
+**理论依据**：TAROT（ACM MMSys 2026）— 优化驱动的 FEC 参数选择。
+直接最大化有效吞吐而非最小化丢包率，避免"为消除最后 1% 丢包浪费 30% 带宽"的问题。
+
+**优点**：理论上最优，不需要预设公式参数。
+**缺点**：收敛慢，需在线探索（exploration cost）。
+
+---
+
+### 算法对照表
+
+| 算法 | 反应速度 | 稳定性 | 实现复杂度 | 适用场景 |
+|------|:---:|:---:|:---:|------|
+| 0 Static | N/A | ★★★★★ | 最简单 | baseline 对照 |
+| 1 EWMA+Static | ★★ | ★★★★ | 简单 | 当前实现，稳定链路 |
+| 2 EWMA+Dynamic | ★★ | ★★★★ | 中等 | 丢包波动大的链路 |
+| 3 PI | ★★★ | ★★★★ | 中等 | 需要稳态无差 |
+| 4 MIMD | ★★★★★ | ★★★ | 简单 | 需要快速响应突变 |
+| 5 Quantile | ★★ | ★★★★★ | 中等 | 偶发尖峰、稳定链路 |
+| 6 Burst-Aware | ★★★★ | ★★★★ | 较复杂 | 真实链路含突发 |
+| 7 Gradient | ★ | ★★★ | 复杂 | 理论最优、代价可接受 |
+
+### 测试方案：可控丢包率
+
+`FecConfig` 新增字段：
+
+```cpp
+struct FecConfig {
+    // ... 现有字段 ...
+    uint8_t algo = 1;            // 自适应算法 0~7
+    float test_drop_rate = 0;    // 主动随机丢包率 0.0~1.0 (0=禁用)
+    uint32_t test_drop_burst = 1; // 丢包突发长度 (1=随机独立丢包)
+};
+```
+
+### 主动丢包模型（测试用）
+
+主动丢包在 `FecPipeline::Process()` decode 路径入口实现：收到包后先经过 `LossPattern::ShouldDrop()`，
+若返回 true 则丢弃（模拟丢包），否则送入 decoder。
+
+`FecConfig` 字段：
+
+```cpp
+uint8_t  test_drop_pattern = 0;  // 丢包模型 0~6 (0=禁用)
+float    test_drop_rate  = 0.0f; // 基础丢包率
+float    test_drop_rate2 = 0.0f; // 辅助参数 (各模型含义不同)
+uint32_t test_drop_burst = 1;    // 突发长度 / 周期
+```
+
+#### 模型 0: Disabled — 关闭主动丢包
+
+#### 模型 1: Bernoulli（独立随机丢包）
+
+每个包以概率 `p = test_drop_rate` 独立丢弃。**无记忆性**，相邻包丢包不相关。
+
+```
+ShouldDrop(): return rand() < p
+```
+
+最基础的 baseline。真实链路（尤其是无线链路）的丢包通常是突发的，
+Bernoulli 模型无法体现这一点。
+
+#### 模型 2: Gilbert（2 状态 Markov 突发丢包）
+
+两个状态：Good（0% 丢包）和 Bad（100% 丢包）。
+
+```
+       p (Good→Bad)
+    ┌──────────────►
+  Good (0% loss)   Bad (100% loss)
+    ◄──────────────
+       r (Bad→Good)
+
+平均突发长度 = 1/r
+平均良好长度 = 1/p
+稳态丢包率   = p / (p + r)
+```
+
+**参数映射**：
+- `test_drop_rate` = 稳态丢包率目标
+- `test_drop_burst` = 目标平均突发长度（packets）
+- `r = 1.0 / test_drop_burst`
+- `p = r * test_drop_rate / (1 - test_drop_rate)`
+
+**适用范围**：无线衰落信道的一阶近似。丢包成簇出现，比 Bernoulli 更真实。
+
+#### 模型 3: Gilbert-Elliott（2 状态 Markov 带背景丢包）
+
+Gilbert 的扩展：Good 状态也有非零丢包率 k，Bad 状态丢包率 h<1。
+
+```
+       p (Good→Bad)
+    ┌──────────────────────►
+  Good (k% loss)        Bad (h% loss)
+    ◄──────────────────────
+       r (Bad→Good)
+```
+
+**参数映射**：
+- `test_drop_rate` = 稳态丢包率目标
+- `test_drop_rate2` = Good 状态丢包率 k（背景噪声，default 0.01）
+- `test_drop_burst` = 目标平均突发长度
+- `h = min(k + (test_drop_rate - k) / π_bad, 0.95)`
+- `r = 1.0 / test_drop_burst`
+- `p = r * π_bad / (1 - π_bad)`
+
+**适用范围**：Wi-Fi、LTE/4G 等真实无线链路的 empirical 验证最佳模型。
+标准文档广泛引用（str0m-netem, IEEE 802.11 仿真）。
+
+#### 模型 4: Sinusoidal（正弦波动丢包）
+
+丢包率随时间呈正弦变化，模拟周期性拥塞（如每天高峰时段、TCP 全局同步）。
+
+```
+loss_rate(t) = baseline + amplitude * sin(2π * t / period)
+```
+
+**参数映射**：
+- `test_drop_rate` = 峰值丢包率（baseline + amplitude）
+- `test_drop_rate2` = 谷值丢包率（baseline，默认 0.01）
+- `test_drop_burst` = 周期（秒），默认 60
+
+```
+baseline  = test_drop_rate2
+amplitude = test_drop_rate - test_drop_rate2
+```
+
+每个包仍按瞬时 loss_rate 做 Bernoulli 丢弃。
+
+**适用范围**：测试算法对缓慢周期性变化的跟踪能力。
+
+#### 模型 5: Step（阶跃突变丢包）
+
+丢包率在指定时间点从低值突跳到高值（或反过来），模拟链路故障/恢复。
+
+```
+loss_rate(t) = rate_before  (t < step_time)
+loss_rate(t) = rate_after   (t >= step_time)
+```
+
+**参数映射**：
+- `test_drop_rate` = 突变后丢包率
+- `test_drop_rate2` = 突变前丢包率（默认 0.01）
+- `test_drop_burst` = 突变发生时间（秒），默认 30
+
+**适用范围**：测试算法对突变的响应速度（反应延迟、overshoot）。
+
+#### 模型 6: Congestion Wave（拥塞波丢包）
+
+丢包率先线性爬升到峰值再线性回落，模拟真实拥塞事件（buffer 填满→排空）。
+
+```
+loss_rate(t) = min_rate + (max_rate - min_rate) * triangle(t / period)
+```
+
+其中 `triangle(x) = 2 * |2*(x mod 1) - 1|`（对称三角波）。
+
+**参数映射**：
+- `test_drop_rate` = 峰值丢包率
+- `test_drop_rate2` = 基线丢包率（默认 0.01）
+- `test_drop_burst` = 周期（秒），默认 120（2分钟爬升 + 2分钟回落 = 4分钟周期）
+
+**适用范围**：最接近真实 Internet 拥塞模式。测试算法在丢包率持续变化下的表现。
+
+### 丢包模型对照表
+
+| 模型 | 名称 | 关键特征 | 测试目标 |
+|:---:|------|------|------|
+| 0 | Disabled | 无丢包 | 验证无丢包时 overhead 收敛到最小值 |
+| 1 | Bernoulli | 独立随机 | baseline 对照 |
+| 2 | Gilbert | 2状态突发 | 突发丢包适应能力 |
+| 3 | Gilbert-Elliott | 2状态+背景噪声 | 真实无线链路模拟 |
+| 4 | Sinusoidal | 周期性正弦 | 缓慢变化的跟踪能力 |
+| 5 | Step | 阶跃突变 | 反应速度和 overshoot |
+| 6 | Congestion Wave | 三角波拥塞 | 真实拥塞场景综合评估 |
+
+### 测试流程
+
+1. 同一机器启动两个 great-hole 实例（不同端口），loopback
+2. 对每种丢包模型，设置不同丢包率档位 (1%, 5%, 10%, 20%)
+3. 分别跑 8 种自适应算法，iperf3 测 TCP/UDP 吞吐
+4. 记录每个测试的：有效吞吐、overhead 均值/峰值/稳态值、丢包恢复率、算法收敛时间
+5. 按测试场景加权评分，汇总对比表供选择
+
+### overhead 上限
 
 overhead 上限由 `max_overhead` 控制（default 0.50）。
 
@@ -365,6 +739,16 @@ struct FecConfig {
     uint32_t feedback_stale_ms = 10000;   // 无反馈回退 overhead 超时
     uint32_t ping_loss_threshold = 5;     // 连续丢 PING 阈值
     uint32_t decode_timeout_ms = 200;     // 初始解码超时 (RTT 校准后覆盖)
+
+    // === 自适应算法 ===
+    uint8_t algo = 1;                  // 算法选择 0~7
+    float loss_deadband = -1.0f;       // -1=禁用; >=0: 实测丢包 ≤ 该值时编码器不发 repair (零丢包链路 0% 补偿)
+
+    // === 可控丢包测试 ===
+    uint8_t test_drop_pattern = 0;     // 丢包模型 0~6 (0=禁用)
+    float test_drop_rate = 0.0f;       // 基础丢包率 / 峰值
+    float test_drop_rate2 = 0.0f;      // 辅助参数 (模型相关)
+    uint32_t test_drop_burst = 1;      // 突发长度 / 周期 (模型相关)
 };
 ```
 
@@ -410,6 +794,9 @@ fec_cfg = {
     feedback_stale_ms = 10000,
     ping_loss_threshold = 5,
     decode_timeout  = 200,
+    algo            = 1,            -- 自适应算法 0~7
+    test_drop_rate  = 0.0,          -- 主动丢包率 (0=禁用)
+    test_drop_burst = 1,            -- 丢包突发长度
 }
 
 -- FEC Pipeline
@@ -443,11 +830,128 @@ p_recv = hole.fec_pipeline(udp_chan, {xor_filter}, app_chan, fec_cfg)
 - IV XOR
 - 丢包率统计 + feedback 闭环
 - RTT echo 机制
-- AdaptiveOverhead
+- AdaptiveOverhead（算法 1 先实现）
 
-### Phase 5: 集成测试
-- 本地 loopback: encode → 丢包仿真 → decode
-- ali-osaka 实际链路
+### Phase 5: 可控丢包测试框架
+- `test_drop_rate` / `test_drop_burst` 实现
+- Gilbert 突发丢包模型
+- 单机 loopback 测试脚本
+
+### Phase 6: 多算法实现与对比
+- 实现算法 0~7 共 8 种
+- 同机可控丢包率测试 (0%, 1%, 5%, 10%, 20%)
+- 每算法测 TCP + UDP 吞吐，记录 overhead 均值/峰值
+- 汇总对比表，确定最终选择
+
+### Phase 7: 真实链路验证
+- ali-osaka / ali-tokyo 实际链路测试
+- 与算法 0 (static) 对比提升幅度
+- 长时稳定性测试 (24h+)
+
+## Test Results — 8 算法矩阵测试
+
+> **测试环境**: tokyo, netns 隔离, 100Mbps / 100ms RTT (tc netem on veth), iperf3 TCP 10s  
+> **配置**: Static 基准 overhead=15%, 自适应算法 overhead=1% 起步, safety_margin=0.01  
+> **矩阵**: 8 算法 × 6 丢包模式 × 4 丢包率 = 192 项, 零测试失败 (status=ok 192/192)  
+> **日期**: 2026-07-02 ~ 2026-07-03
+
+### 原始测试数据
+
+完整 CSV: `tokyo:/tmp/regression.csv` (192 行)
+
+### 8 算法对比矩阵 (recv Mbps, iperf3 TCP)
+
+#### Static (15% overhead) — 基准对照
+| Pattern | 1% | 5% | 10% | 20% |
+|---------|:---:|:---:|:---:|:---:|
+| Bernoulli | 52.6 | 13.6 | 11.1 | 0.3 |
+| Gilbert | 18.9 | 0.9 | **0.0** | 0.1 |
+| GElliott | 72.7 | 1.4 | 0.4 | 0.1 |
+| Sine | 61.4 | 65.3 | 40.8 | 24.0 |
+| Step | 64.9 | 54.9 | 7.3 | 8.0 |
+| CongWave | 72.2 | 62.7 | 34.6 | 27.5 |
+| **平均** | **57.1** | **33.1** | **15.7** | **10.0** |
+
+#### PI (1%→自适应) — 最佳自适应
+| Pattern | 1% | 5% | 10% | 20% |
+|---------|:---:|:---:|:---:|:---:|
+| Bernoulli | **57.8** | 6.9 | 1.5 | 0.3 |
+| Gilbert | **39.5** | **13.0** | **1.7** | 0.0 |
+| GElliott | 15.6 | **3.2** | 0.5 | 0.2 |
+| Sine | **71.4** | 37.0 | **57.7** | 19.1 |
+| Step | 61.8 | 28.8 | **28.6** | 9.8 |
+| CongWave | 70.0 | 58.7 | **62.2** | **40.1** |
+| **平均** | **52.7** | **24.6** | **25.4** | **11.6** |
+
+#### MIMD (1%→即刻响应)
+| Pattern | 1% | 5% | 10% | 20% |
+|---------|:---:|:---:|:---:|:---:|
+| Bernoulli | 10.8 | 1.1 | 0.8 | 0.2 |
+| Gilbert | 12.4 | 1.5 | 0.7 | **0.2** |
+| GElliott | 4.1 | 0.9 | **0.8** | **0.3** |
+| Sine | 30.5 | 17.3 | 25.4 | 7.9 |
+| Step | 7.2 | 12.7 | 10.2 | **11.8** |
+| CongWave | 35.4 | 34.9 | 31.1 | 14.4 |
+| **平均** | **16.7** | **11.4** | **11.5** | **5.8** |
+
+#### Gradient (1%→梯度下降)
+| Pattern | 1% | 5% | 10% | 20% |
+|---------|:---:|:---:|:---:|:---:|
+| Bernoulli | 52.9 | 2.4 | 0.7 | 0.2 |
+| Gilbert | 11.4 | 1.0 | 0.6 | 0.4 |
+| GElliott | 33.5 | 2.9 | 0.4 | 0.1 |
+| Sine | 65.4 | **66.0** | 11.2 | 19.0 |
+| Step | 13.4 | 5.1 | 5.3 | 4.0 |
+| CongWave | 62.4 | 45.3 | 40.5 | 38.9 |
+| **平均** | **39.8** | **20.5** | **9.8** | **10.4** |
+
+#### EWMA+Stat / EWMA+Dyn / Quantile / BurstAware
+| Algo | 平均 | 特点 |
+|------|:---:|------|
+| EWMA+Stat | 10.4 | 收敛过慢，10s 内效率低 |
+| EWMA+Dyn | 9.4 | 动态余量在 Sine 有优势 |
+| Quantile | 9.8 | 无显著差异 |
+| BurstAware | 8.1 | 突发感知未发挥作用 (测试时间太短) |
+
+### 最终排名
+
+| # | 算法 | 平均 Mbps | 每格最优 | 零死格 | 推荐场景 |
+|:--:|------|:---:|:---:|:---:|------|
+| 1 | **PI** | 29.8 | **10/24** | 1 | **全场景最优自适应**, 积分控制收敛快 |
+| 2 | Static (15%) | **30.2** | 9/24 | 1 | 稳定链路, 低丢包, 最简单 |
+| 3 | Gradient | 20.1 | 2/24 | 0 | Sine/CongWave 时变丢包 |
+| 4 | MIMD | 11.4 | 3/24 | **0** | **最可靠**, 突发丢包无死角 |
+
+### 关键发现
+
+1. **PI 是最佳自适应算法**: 平均 29.8 Mbps 接近 Static 的 30.2。Gilbert 10% 时 PI=1.7 vs Static=0.0（Static 死透）。集成控制 (Kp=1.5, Ki=0.8) 令其 10 秒内快速收敛。
+
+2. **Static 15% 基准线可靠但脆弱**: 平稳丢包无敌，但 Gilbert 10% 跌至 0 Mbps——链路彻底断开。
+
+3. **MIMD 零死格**: 唯一在所有 24 格都保持 >0 的算法。即时×1.50 反应优势在突发丢包中体现，但低丢包时 overhead 过高导致吞吐偏低。
+
+4. **EWMA 类算法在短测试中无效**: 从 1% 起步，10 秒测试 + 100ms RTT 反馈延迟不足以让 alpha=0.3 的 EWMA 收敛到目标水平。
+
+5. **丢包模式影响远大于丢包率**: Gilbert 10% (0 Mbps) 比 Bernoulli 20% (0.3 Mbps) 更致命。突发丢包导致 tunnel 断连。
+
+6. **100ms RTT 对自适应不利**: 反馈环路延迟使收敛时间翻倍。MIMD 的即时反应在此场景下是正确选择。
+
+### 自适应算法选型决策树
+
+```
+链路特征:
+  ├─ 稳定, 丢包率 <5%       → Static (15% overhead)
+  ├─ 偶尔突发丢包 (10-20%)   → MIMD (即时反应, 最可靠)
+  ├─ 持续可变丢包 (5-15%)    → PI (积分控制, 收敛快)
+  └─ 时变丢包 (正弦/拥塞波)  → Gradient 或 PI
+```
+
+### 已知局限
+
+- **10 秒测试太短**: EWMA/Quantile/BurstAware 的慢收敛被放大。建议至少 30 秒 iperf3。
+- **初始 overhead=1% 偏低**: 从 1% 起步对 EWMA 过于苛刻。建议默认从 5% 起步。
+- **Static 不应算作"自适应"**: Static 15% 是固定基准，非自适应。后续测试应分离 Static 和自适应算法的初始 overhead。
+- **100ms RTT 是模拟值**: 实际 ali↔tokyo 约 60ms RTT。本地 netns 测试用于功能验证，性能对比以远程实测为准。
 
 ## Non-Goals
 
@@ -459,3 +963,397 @@ p_recv = hole.fec_pipeline(udp_chan, {xor_filter}, app_chan, fec_cfg)
 
 - **Timer 集成**: `steady_timer` + `AsioUseFiber` + `Select` 在 omni-fiber 中完全可用。Pipeline 构造加 `io_context&`。
 - **Pipeline batch 模式**: `Pipeline::virtual Process()` → `FecPipeline::Process()` override。
+
+## 实测性能总结 (2026-07-05)
+
+### 测试环境
+
+- Ali (<ALI_PUB_IP>) ↔ Tokyo (<TOKYO_PUB_IP_OLD>), RTT ~60ms
+- 直连带宽: TCP 101 Mbps, UDP 100 Mbps 零丢包
+- FEC 配置: `timeout_ms=4, max_batch=20, overhead=0.01, algo=0 (Static)`
+- 编译器: Debian 13, clang-19, Boost 1.83
+
+### 吞吐量对比
+
+| 测试 | 直连 | FEC (RaptorQ) | 嵌套 (UDPspeeder RS 50%OH) |
+|------|:---:|:---:|:---:|
+| TCP T→A | 101 Mbps | **42 Mbps** | 62 Mbps |
+| TCP A→T | 95.7 Mbps | - | 49.7 Mbps |
+| TCP CWND 峰值 | 1 MB | 350 KB | 650 KB |
+| TCP 重传 | 1523 | **166** | 3004 |
+| UDP 80M | 79.7 (0%) | **79.5 (0%)** | 66.7 (16% loss) |
+| UDP 100M | 97.5 (0%) | **87.0 (0%)** | 60.3 (39% loss) |
+
+### 架构分析
+
+**FEC 编码器最终设计 (Two-fiber)**:
+
+```
+Reader fiber: co_await TUN Read() → TryRead loop (~70% hit rate, ~3.3 pkts/cycle)
+                                  → push to batch_queue
+
+Main fiber:   queue empty → 100us poll timer
+              queue data  → drain to batch
+              batch full (max_batch=20) or timeout (4ms) → SendBatch
+              SendBatch: pkt_count==1 → REPEAT copies=N (fast path)
+                         pkt_count>1  → RaptorQ K symbols + ceil(K*oh) repair
+```
+
+**关键发现**:
+
+1. **TryRead 成功率 ~70%**（非 handoff 中声称的"总是 EAGAIN"）。reader 每周期产出 ~3.3 个包。
+2. **FEC 实际开销 5.7%**（非配置的 1%）。原因: `ceil(K×0.01)` 取整，K≈17 时 ceil(0.17)=1，`1/17=5.9%`。需 K≥100 才能实现真正的 1%。
+3. **Batch 延迟是 TCP 吞吐杀手**（非 FEC 开销）。UDPspeeder (50% OH, 62 Mbps) 比 RaptorQ (5.7% OH, 42 Mbps) 快 48%，因为 UDPspeeder 不制造 ACK 压缩/延迟抖动。
+4. **FEC 消除丢包但对 TCP CWND 增长有抑制作用**：FEC TCP 重传 166 vs 直连 1523，但 CWND 仅 350 KB vs 直连 1 MB。
+5. **Boos.Asio epoll 为 EPOLLET（边沿触发）**。`async_read_some` 投机执行单次 `readv()`，配合 TryRead 循环排空缓冲。
+6. **PING/FEEDBACK 开销微秒级**（UDP async_send_to 立即完成），非 RTT 延迟。无需隔离到 batch 之间。
+
+### 未来改进方向
+
+1. **即发后补 (send-immediately + repair-later)**: 数据包到达即发送（REPEAT copies=1，零延迟），凑够 K 个后补发 RaptorQ 修复符号。需改造 wire format（包对齐 symbol 边界）和 decoder（REPEAT + repair 符号混合解码）。
+2. **减小 max_batch + 增大 timeout**: 减少 batch 突发度，降低 ACK 压缩效应。
+3. **解码端 pace 输出**: 解码后的原始包以微间隔输出到 TUN，避免 TCP ACK 爆发。
+
+## 追加发现 (2026-07-05 深夜调试)
+
+### FEC 版 Pipeline 基类改动导致 nofec 性能退化 3 倍
+
+使用原始 great-hole 二进制（Ali-Osaka 版本）和 FEC 版 great-hole-fec 二进制，运行**完全相同的 nofec 配置**对比：
+
+| 版本 | 配置 | 吞吐 | CWND |
+|------|------|------|------|
+| 原始 great-hole (v0.2.0) | XOR + Pipeline | **93.9 Mbps** | 596-748 KB |
+| great-hole-fec (当前分支) | XOR + Pipeline (同配置) | **27.7 Mbps** | 287-321 KB |
+| great-hole-fec | FecPipeline (RaptorQ) | 38-45 Mbps | 246-361 KB |
+
+**结论：FEC 分支对 Pipeline 基类的改动（`virtual Process()` + `io_context&`）破坏了普通 Pipeline 的性能，即使不使用 FecPipeline 也受影响。** FecPipeline 自身的 batch 延迟进一步降低了吞吐。原始二进制恢复后隧道吞吐从 27.7 恢复到 93.9 Mbps。
+
+### ER-X 硬件瓶颈
+
+Ali↔ER-X 间 WireGuard 性能非对称：
+- ER-X **接收** (Ali→ER-X): 145 Mbps — 解密快
+- ER-X **发送** (ER-X→Ali): **48 Mbps** — MT7621A CPU 加密上限
+
+Google 测速下载 47.7 Mbps 即受限于 ER-X WireGuard 发送能力。上传 7.5 Mbps 是因为 Google 选中香港服务器（325ms RTT）导致 TCP BDP 受限。
+
+### 出口切换持久化
+
+`switch-exit` 脚本已更新：切换出口时写入 `/etc/great-hole/fec/exit-target`，`wg0.conf` PostUp 读取此文件决定使用 table 101 (Osaka) 或 table 102 (Tokyo)。WireGuard 重启/服务器重启后出口选择保持不变。
+
+## 实测性能基线 (2026-08-05, 新 Tokyo 1vCPU)
+
+> **测试环境**: Ali (<ALI_PUB_IP>) ↔ Tokyo (<TOKYO_PUB_IP>, 2026-08-04 重建), RTT ~65ms
+> **Tokyo 规格**: Debian 13, **1 vCPU** (AMD EPYC-Rome), 1.9GB RAM, ~23% steal time
+> **测试链路**: fec-test 专用隧道 (UDP 20086 直连, 不经 speederv2), TUN 172.31.40.0/30, MTU 1420
+> **FEC 配置**: timeout_ms=1, max_batch=20, overhead=1% PI (algo=3), symbol_size=1440
+
+| 测试 | 直连 | FEC 隧道 | 说明 |
+|------|:---:|:---:|------|
+| TCP T→A | 36~69 Mbps | **16.1 Mbps** | 直连波动大 (链路质量波动) |
+| TCP A→T | 91.7 Mbps | **13.7 Mbps** | 方向不对称 |
+| UDP 80M T→A | 76.4 (0%) | **27.0 Mbps** | |
+| UDP 100M T→A | 95.4 (0%) | - | |
+| UDP 80M A→T | - | **25.1 Mbps** | iperf3 lost% 因 FEC 重排失真 |
+
+### 关键结论
+
+1. **新 Tokyo 链路直连能力完好** (UDP 95M / TCP 91.7M A→T)，重建实例无带宽损失。
+2. **FEC 编码器吞吐上限 ~27 Mbps (双向一致)** — 1 vCPU 是硬瓶颈 (RaptorQ 编码 + 双 fiber + 23% steal)。历史 42Mbps 数据来自旧 Tokyo 多核实例。
+3. **调参有效**: timeout_ms 4→1 + max_batch 200→20 使 FEC TCP 3.8→16.1 Mbps (×4)。
+4. **直连 TCP 方向不对称** (T→A 36~69 vs A→T 91.7) — 国际链路波动，非隧道问题。
+5. FEC UDP 与直连的差距 (27 vs 95M) 全部来自编码 CPU，非链路或配置。
+
+## Batch 延迟假说验证 (2026-08-05) — 旧结论修正
+
+> 旧结论 (2026-07-05): "Batch 延迟是 TCP 吞吐杀手" — **实测证伪，已修正**
+
+### 代码事实
+
+`SendBatch` FEC 路径 (FecPipeline.cpp:327-363): `BuildBlob`（攒全部包）→ 一次性 `rq.Encode(blob)` → 循环 `GenerateSymbol` → 最后 `WriteBatch` 整体发出。**第一个符号确实必须等整组编码完成** — "攒够全组才能开始生成第一个包"属实。
+
+### 实测对照 (tokyo 1vCPU, 2026-08-05)
+
+| 配置 | 组延迟 | TCP | UDP 80M |
+|------|:---:|:---:|:---:|
+| timeout=1ms, max_batch=20 | 低 | 16.1M | 27.0M |
+| **max_batch=1** (单包 REPEAT 快路径) | **零** | **16.7M** | **53.4M** |
+| timeout=8ms, max_batch=200 | 高 | **21.3M** | - |
+
+### 结论
+
+1. **组延迟与 TCP 吞吐无相关性** (batch=1 零延迟 TCP 仍 16.7M；8ms 长延迟反而 21.3M) — "batch 延迟导致 TCP 差"证伪。
+2. **TCP 瓶颈 = 单核 CPU 饱和**: TCP 测试中 great-hole-fec 进程 CPU 达 99.9% (双向数据+ACK 都要 FEC 编解码)。UDP 单向编码 → CPU 限制点不同。
+3. **RaptorQ 每包开销 > speederv2 GF256 档位编码**: 生产嵌套 (speederv2, 小包 1:1 复制) TCP 38.9M vs great-hole FEC 16-24M，同为单核。
+4. UDP 受编码 CPU 限制: batch=20 时 RaptorQ 编码 27M；batch=1 REPEAT 无编码 53.4M — 印证 RaptorQ 编码是 CPU 大头。
+5. **推论**: 提升 FEC TCP 吞吐的正路 = 减每包 CPU 开销 (ACK/小包走 REPEAT copies=1 直发, 仅大包 RaptorQ) + 多核，而非调 batch 延迟。
+
+## lcrq 复测 (2026-08-05) — 研究数据失真确认
+
+> 研究阶段 (fec-research.md) 记录: osaka 563Mbps / ali 1769Mbps (K=32K symbols, T=1024)
+> **复测 (tokyo 1vCPU AMD EPYC-Rome, lcrq v0.3.1, 官方 examples/speedtest.c):**
+
+| K | T | 编码 | 解码 | 备注 |
+|:--:|:--:|:---:|:---:|------|
+| 17 | 1440 | **31.4 Mbps** | 30.2 Mbps | 我们的实际组大小 (max_batch=20) |
+| 17 | 1440 | 34.2 Mbps (-O3) | 30.8 | 优化级别无影响 |
+| 200 | 1024 | 31.0 Mbps | 30.3 | |
+| 1000 | 1024 | 8.9 Mbps | - | K 增大 init 开销 O(K²) 反噬 |
+| 32768 | 1024 | (init >20min 未完成) | - | 研究参数在本机不可行 |
+
+### 结论
+
+1. **lcrq 小 K (K≤200) 在 tokyo 单核实测 ~30 Mbps** — 与我们 FEC 隧道 UDP 27M **完全吻合**。集成无额外损失，瓶颈就是 lcrq 编码本身。
+2. **研究数据失真**: 563/1769 Mbps 来自 **AVX-512 CPU (osaka Cascadelake / ali Xeon Platinum) + K=32K 摊薄**。tokyo EPYC-Rome **无 AVX-512**，且 K=32K 的 rq_init O(K²) 矩阵预计算在本机 >20 分钟 — 研究参数在部署环境不可复现。
+3. **-Og 与 -O3 无差异** (31.4 vs 34.2M) — 优化级别不是原因。
+4. **修正归因**: "batch 延迟"假说证伪 → "CPU 饱和"现象属实 → 根因 = **lcrq 小 K 编码吞吐 (无 AVX-512 时 ~30Mbps)**。REPEAT 快路径 (batch=1, UDP 53.4M) 绕过 RaptorQ 是当前唯一有效提速手段。
+5. **推论**: FEC 隧道吞吐上限 = min(链路, lcrq 小K编码吞吐)。换 AVX-512 实例或减少 RaptorQ 组 (ACK/小包 REPEAT 直发) 才能突破。
+
+## lcrq 瓶颈深挖 (2026-08-05) — 优化与 AVX-512 排除
+
+### 此前结论修正
+
+1. **"-O3 与 -Og 一致"是假象**: configure 的 CFLAGS 只写入顶层 Makefile，`make -C src` 子目录 make 不继承 → 两次测试实际都是 **-O0** 编译 (编译命令 `cc -fPIC -I.` 无 -O 标志确认)。用 `make CFLAGS='-O3 -march=native'` 真正重编后 K=17 仍 32.7M — **优化级别不是瓶颈**。
+2. **AVX-512 排除**: tokyo (AMD EPYC-Rome) 与 osaka (Xeon) 的 /proc/cpuinfo **均无 avx512 标志** (云 vCPU 未透传)，且两台机器 K=17 speedtest **实测一致 (31.4 vs 31.9 Mbps)** — 机器差异不是瓶颈。
+
+### 微基准定位 (tokyo, K=17, T=1440, 逐阶段计时)
+
+```
+rq_init     0.001 ms   (可忽略)
+rq_encode   5.0-11.3 ms  ← 占 99%，瓶颈所在
+rq_symbol ×18  0.06-0.10 ms (可忽略)
+```
+
+**rq_encode = RFC 6330 中间符号计算 (高斯消元 phase0-3 + 矩阵求解)**, 每批一次, O(L²·T) 字节运算, 数学必须开销。K=17 时约 5-11ms/组 → 编码上限 ~32Mbps。
+
+### 最终归因
+
+- FEC 隧道 UDP 27M = lcrq K≤200 编码上限 (~30M) − UDP I/O 开销, **集成无额外损失**。
+- 研究数据 (osaka 563M / ali 1769M, "K=32K symbols") 在两台机器当前构建下**不可复现** (K=1000 已崩至 8.9M, K=32K init >20min; K=17~200 全区间 ~30M) — 研究数据存疑。
+- **突破路径不变**: REPEAT 快路径 (batch=1 UDP 53.4M 已证) 或换 AVX-512 实例 (未验证, 云 vCPU 普遍不暴露 avx512)。
+
+## AVX-512 实锤 (2026-08-05) — 同一二进制三机对照
+
+### 决定性实验: tokyo 编译 (-O3 -march=native) 的同一 lcrq-speedtest 二进制在 3 台机器跑 K=17
+
+| 机器 | CPU | AVX-512 | K=17 编码 | 倍数 |
+|------|-----|:---:|:---:|:---:|
+| tokyo | AMD EPYC-Rome 1vCPU | 无 (云未透传) | 31.4 Mbps | 1× |
+| osaka | Xeon (Cascadelake) | 无 | 31.9 Mbps | 1× |
+| **ali** | Xeon Platinum | **有 (f/bw/cd/dq/vl)** | **241.5 Mbps** | **7.7×** |
+
+ali K=200: 183.1 Mbps。
+
+### 为什么 -O3 不是瓶颈（信服解释）
+
+1. lcrq 热路径 = **手写 SIMD intrinsics** (gf256_avx2.c / matrix_avx512.c)。intrinsics 编译为固定 SIMD 指令，**编译器 -O 级别不影响 intrinsics 执行** — 这是 -O0/-O3 无差异的根本原因。
+2. 无 AVX-512 时走标量/查表路径，编译器优化对查表+位操作提升有限 (31.4→32.7M, +4%)。
+3. 同一二进制在 ali 快 7.7 倍 = 纯指令集差异。**瓶颈 = AVX-512 可用性，不是优化级别**。
+
+### 研究数据 (1769M) 溯源
+
+- ali (AVX-512) 是研究基准机 — 数据真实但仅代表 AVX-512 机器 + K=32K 摊薄。
+- tokyo/osaka 云 vCPU 未透传 avx512 → 实际部署场景只有 ~30M。
+- **fec-research.md 的吞吐数据必须标注"仅 AVX-512 机器有效"**。
+
+### 对隧道的影响
+
+- tokyo 端编/解码均 ~30M (无 AVX-512) → FEC 隧道双向都受 tokyo 限制 (~27M UDP) — 与实测一致。
+- ali 端编码 241M → 若 tokyo 换 AVX-512 实例, FEC 隧道可提升 ~7.7×。
+- REPEAT 快路径 (53.4M) 仍是无 AVX-512 环境下的唯一现实突破。
+
+### 构建文件修复 (同批提交)
+
+- 丢失的 `libs/lcrq/CMakeLists.txt` 从 ali 部署副本找回 → 正式化为 `cmake/lcrq.cmake` (ExternalProject + IMPORTED target)。
+- 主 CMakeLists.txt: `add_subdirectory(libs/lcrq)` → `include(cmake/lcrq.cmake)`。
+- tokyo 全新建树验证可复现。
+
+## 终极归因 (2026-08-05) — tokyo vCPU 算力配额是唯一瓶颈
+
+### 决定性实验链
+
+1. **AVX2 vs AVX512 无差异**: ali 同机同 -O0 库, 仅切换调度路径 — avx512 216.0M vs avx2-only 212.6M (≈相同)。lcrq 的 shuffle 查表 SIMD 瓶颈在内存访问, 不在向量宽度。**"avx2 重写提速"不成立 — AVX2 已启用且与 AVX512 等价**。
+2. **机器算力差距 6.6 倍**: 同一库 (avx2-only, -O0): tokyo 32.5M vs ali 216M。
+3. **CPU 基准**: tokyo 标称 2794 MHz 但 30M 整数循环 9.8s vs ali (2500 MHz) 3.8s — **tokyo vCPU 实际算力只有 ali 的 ~38%** (2.6×), SIMD/内存密集任务放大到 6.6×。
+
+### 结论
+
+- lcrq 无 avx512 时回退 **AVX2** (非 SSE2, cpu.c 逐级检测 + matrix.c 调度正确, 已实证)。
+- **FEC 27M 瓶颈 = GGC tokyo vCPU 算力配额** (超售/节流), 与指令集、优化级别、batch 延迟、集成均无关。
+- **提速正路**: 换更高算力 vCPU (同 ali 算力即可 ~200M, 无需 AVX-512), 或减少 RaptorQ 使用 (REPEAT 快路径 53.4M)。
+- 客服邮件应诉求: CPU 配额/节点超售, 而非 AVX-512。
+
+## RS Codec 选项 (2026-08-05 新增) — Vandermonde GF(256) 在线模式
+
+> **动机**: tokyo vCPU 上 RaptorQ 仅 27M (中间符号高斯消元 5ms/组 是 CPU 大头)。
+> RS 无中间符号, 编码 = 纯 GF 线性组合。**tokyo 标量实测: K=17 时 280-287 Mbps** (RaptorQ 的 10 倍)。
+> 且 RS 系统化分片**源包即收即发** → 消除 batch 延迟 → TCP 接近 nofec。
+
+### 配置
+
+```lua
+fec_cfg = {
+    -- ...现有字段...
+    fec_codec = "rs",        -- "lcrq" (默认, RFC6330) | "rs" (Vandermonde GF256)
+}
+```
+
+### RS 设计 (在线动态补偿)
+
+**核心**: 系统化 Vandermonde RS, repair 分片独立生成 (fec_encode 生成 0..m 任意数量) → 冗余率实时可调, 等价 RaptorQ 的 rateless 在 0..(255-k) 区间。
+
+```
+编码端:
+  源包到达 → 立即发送 (systematic 分片, 零延迟)  ← TCP 友好关键
+           ↘ 攒 batch 窗口 (timeout_ms / max_batch)
+  窗口到期 → AdaptiveOverhead 计算 m (0..255-k)
+           → fec_encode 生成 m 个 repair (Vandermonde 行 × 源符号 GF 乘加)
+           → 补发 (带 batch_id + repair_index)
+
+解码端:
+  源分片 → 序号去重 → 直接交付 (无丢包零解码开销)
+  缺口检测 (batch 窗口内序号不连续) → 等 repair 分片
+          → fec_decode: 构造 k×k 子矩阵, GF(256) 高斯消元求逆 → 恢复缺失源分片
+```
+
+### 约束
+
+- GF(256) 域: k + m ≤ 255 (Vandermonde x 值互异) → max_batch ≤ 100 时冗余上限 155 (37% 覆盖); 单包 k=1 时上限 254
+- 解码 O(k³) GF 运算: 仅丢包时执行; k=17 时 ~5k 次运算 (微秒级); 建议 max_batch ≤ 100
+- wire format: repair 分片头含 batch_id (2B) + repair_index (1B); 源分片含 seq (现有 DWORD 头复用)
+- 与 lcrq 模式互斥 (fec_codec 二选一), 其余配置 (AdaptiveOverhead/LossPattern/测试矩阵) 全部复用
+
+### 实测基准 (tokyo, 标量, 正确性 OK)
+
+| K | m (repair 数) | 编码吞吐 |
+|:--:|:--:|:---:|
+| 17 | 1 | **280 Mbps** |
+| 17 | 5 | 287 Mbps |
+| 17 | 17 | 283 Mbps |
+| 200 | 10 | 22 Mbps (O(k·T), 大 K 受限) |
+
+### 预期隧道性能 (tokyo)
+
+- UDP: ~90M+ (UDPspeeder 同构实测 94.6M; 编码余量 3 倍)
+- TCP: 接近 nofec (源包零延迟, 生产嵌套 38.9M 为参考)
+- 对比 lcrq: UDP 27M → ~90M (3.3×); TCP 16M → ~35M+ (2.2×)
+
+## RS 实测终态 (2026-08-08) — 主线完成
+
+> 分支 fec-writebatch (HEAD 7ea548c → cef207c), 两端部署最终构建。
+> 详细过程见 docs/HANDFOFF-2026-08-08-rs-fec-5-final.md
+
+### 最终结果 (fec-test 隧道 tokyo↔ali, 多次复现)
+
+| 测试 | lcrq (2026-08-05 基线) | RS 最终 | 生产隧道 (无 FEC + UDPspeeder) |
+|------|:---:|:---:|:---:|
+| TCP dl | 16.1M | **88.5 / 86.8M** | 85.3M |
+| TCP ul | 13.7M | **65.2 / 64.3M** | 52.5M |
+| UDP 50M 双向 | ~25-27M | **0% / 0%** | 0% / 0.0044% |
+| 实际补偿率 | ~5.7% (lcrq) | **5.0%** (repair/shard) | — |
+
+> 预期 (90M UDP / ~35M TCP) 全部达成; TCP 实测 88.5M 甚至接近生产隧道。
+
+### TCP 停滞根因链 (乱序投递修复前, 5a201ca)
+
+```
+线路偶发乱序/延迟 (线路本身 0% 丢, 裸连 UDP 100M 双向 0%)
+→ watermark 保序: 缺口卡 200ms → guard "跳过" = 暂时缺口变永久丢失
+→ dup ACK 风暴 (306 ACK/s = 13 倍) → 重传 burst (800-1000 shard/s)
+→ 中间设备丢 burst (裸连稳态 0% 丢; burst 时 31%)
+→ 循环自维持 → TCP 0.2-14M
+```
+
+**修复** = 乱序投递 (缺口不阻塞后续分片, 数据不丢, 交给 TCP 重排) + repair 摊开 (1ms 间隔, 避免与批次尾叠加 burst)。借鉴 UDPspeeder (mode 1 + -t)。
+
+**关键教训**: 曾把 15% 端到端差异归因线路 (ER-X)——被纠正: 裸连 100M 0% 证明线路不丢, 放大器在解码端自身。
+
+### 补偿率调查结论
+
+- **PI (algo=3) 在零丢包线路上必浪费**: 积分漂移把 overhead 推到 15.5% 固定高位; 配置 floor 只挡下限挡不住向上漂移 (ae9cbd9 修冷启动 m=0, 但漂移是设计行为)
+- **algo=1 (EWMA)**: `oh = loss/(1-loss) + safety`, 零丢包 ~5% (可衰减), 15% 丢包 ~19% — 与 UDPspeeder 多档按需同思路
+- 实测: 补偿率 15.5% → 5%, TCP ul 62 → 65M, 吞吐不降反升
+
+### 实际 wire format (纠正 2026-08-05 设计)
+
+RS repair 分片 (与设计"batch_id 2B + repair_index 1B"的偏差):
+
+```
+[DWORD: 24-bit bid + kRsRepair(bit6)][fb 1B][bid 24-bit LE (高字节在前)][k 1B][repair_idx 1B][T payload]
+```
+
+- **bid 全 24-bit** (非 2B): 16-bit 截断会在 seq > 65535 (~94MB 流量) 后错乱
+- 字节序教训 (f082528): PushFrontLE 逆序 prepend — 先 push 高字节再 push 低 16 位; 曾 push 低 16 先 → wire 变 [hi lo0 lo1], 解码重建出乱码 bid, repair 永不触发
+- RS 源分片: `[DWORD seq][fb 1B][u16 dlen][payload pad 至 T]`, 即收即发零 batch 延迟
+- 小包 (<256B payload) 直发: kRsSmall(bit3) + 自适应重复 (seq=0 不占 RS 序号空间)
+- kRsRepair 复用 kRepeat 位 (bit6): RS 模式下 kRepeat 永不置位
+
+### 最终配置推荐 (零丢包/近零丢包链路)
+
+```lua
+-- configs/fec-test-*.lua (已入库)
+fec_codec = "rs",
+algo = 1,              -- EWMA + Static Safety
+overhead = 0.03,       -- 实测补偿率 5.0% (vs PI 的 15.5%)
+decode_timeout = 200,
+```
+
+丢包链路选型仍沿用矩阵测试决策树 (PI 最佳自适应 / MIMD 最可靠)。
+
+### 遗留
+
+1. TCP 重传仍高 (dl ~1105-1953): 乱序投递的 dup ACK 快速重传, 数据全到无害; 若要压低 → repair 摊开间隔 / timeout 调优
+2. 24h soak 未做
+3. 反向 80M UDP 未重测 (50M 已 0%)
+4. 生产隧道 (无 FEC great-hole + UDPspeeder) 是否升级到 RS 构建: 已评估,见文末 "生产嵌套 vs RS FEC 对比实测 (2026-08-13)"
+
+## loss_deadband: 零丢包 0% 补偿 (2026-08-13, 已验证)
+
+> 5.0% 实测补偿率是量化下限而非丢包驱动: `m = ceil(k × oh)`,oh=safety_margin(0.01) 时 k≤100 恒 m=1 → 满批 1/20=5%。
+
+### 配置
+
+```lua
+loss_deadband = 0.005,   -- -1=禁用(默认); 实测丢包 ≤ 该值时编码器不发 repair
+                         -- 两侧独立配置: 本侧 encoder 管本侧发送方向
+```
+
+### 两个必须同时修的测量 latch (否则 deadband 永不退出)
+
+1. **统计依赖 repair 到达**: 旧统计在 repair 槽释放时计数,deadband 下无 repair → 无统计 → fb=0 → 死锁。改为**槽驱逐原始丢包统计**: 源分片认领环槽(4096)时,预期前住户 seq-4096 未到 → 计 1 丢。整环周期宽限容忍乱序,统计原始线路丢包。
+2. **latest_loss_rate 字段混用**: 本地测量与对端 fb 回读共用一字段,回读每包覆盖写,干净反向流清零丢包方向测量。拆为 `latest_loss_rate`(本地,供 fb 外发)与 `peer_loss_rate`(对端,供控制器与门控)。
+
+### 实测 (fec-test, 双侧 0.005)
+
+| 场景 | repair/shard |
+|---|---|
+| 干净线路 | **0.0000%** (TCP 80.2M, 不降反升) |
+| 真实丢包突发 | 5-14%, ~1-2s 响应 |
+| 突发结束 | 0% @ 全速 (自动归零) |
+| 3% Step 丢包 | m=1 恢复, 116 次 recovered 日志 |
+
+**已知限制**: 检测延迟 = 一个环周期,满载 ~0.5s / 低速率 ~40s;EWMA 爬升慢(alpha=0.1)在持续高丢包下保护不足(既有特性,非回归)。
+
+## 生产嵌套 vs RS FEC 对比实测 (2026-08-13, 两轮同窗口)
+
+> **被测对象**: 生产嵌套 = great-hole 无FEC + 外层 speederv2 `-f1:1,20:2,30:2` mode 0(TUN 172.31.30.0/30);fec-test = RS FEC(algo=1, overhead=0.03, loss_deadband=-1 底补偿 m=1, TUN 172.31.40.0/30)。同窗口顺序测试,每轮 TCP dl/ul + UDP 50M 双向各 15s。速度单位 Mbps,括号为重传数。
+
+| 方向 | 轮次 | 生产嵌套 | fec-test (RS) |
+|---|---|---|---|
+| T→A | 1 | **92.2**(1380) | 88.3(1456) |
+| T→A | 2 | 51.4(**2519**) | **89.8**(1215) |
+| A→T | 1 | 53.3(245) | **84.5**(35) |
+| A→T | 2 | 44.5(230) | **65.8**(186) |
+| UDP 双向 50M | 1/2 | 0% / 0% | 0% / 0% |
+
+### 结论
+
+1. **线路干净窗口: 生产 T→A 略优 (+4M)** — speederv2 mode 0 blob 重组天然保序, TCP 少受 dup-ACK 砍 CWND 之苦, 能推到 ~101M wire (≈网口上限);RS 零延迟 systematic + 乱序投递把线路抖动原样传给 TCP, 在 ~94M wire 停住, ~6M 闲置。
+2. **线路劣化窗口: fec-test 明显更抗打 (T→A 89.8 vs 51.4)** — 生产 speederv2 固定 y=2/批, 突发丢包超覆盖即 TCP 坍塌 (2519 重传);RS 的 EWMA 自适应爬升把 TCP 护在 ~89M。生产 T→A 两轮 92→51 剧烈波动, fec-test 88→89 稳定。
+3. **A→T 两轮 fec-test 均胜** (84.5/65.8 vs 53.3/44.5), 生产 A→T 稳定偏弱。
+4. **生产升级评估参考**: 日常干净窗口生产够用; 线路波动时 RS 自适应的保护能力显著更强。RS 的乱序投递代价 (干净窗口 -4M) 可通过 repair 摊开间隔 / 解码端 pacing 调优。
+
+### 测量方法备忘
+
+- 线路日间/分钟级波动可达 40M+, 跨时间单点对比无意义, 必须同窗口连续测试
+- speederv2 `--report 5` 的 journal 计数器可直接验证测试流量是否经过该隧道 (注意时区: journald 显示 UTC)
+- 生产隧道 TUN 两端地址: tokyo 172.31.30.2 / ali 172.31.30.1
