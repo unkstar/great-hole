@@ -296,15 +296,14 @@ ip link set fec0 mtu 1380 up
 ip route replace 172.31.40.2 dev fec0 2>/dev/null || true
 ```
 
-### 7.3 出口切换(`scripts/switch-tunnel.sh`)
+### 7.3 出口切换（本地运维项, 不在本仓库）
 
-```bash
-ALI_SUDO_PW='<sudo 密码>' bash scripts/switch-tunnel.sh {fec|prod|status}
-```
+出口切换脚本（`switch-tunnel` / `switch-exit` 及隧道 up/down 脚本）为**本机/隧道基础设施专用**，
+含真实网络配置，**不随本仓库分发**（历史已清除），保存于本地运维档案（network-topo `scripts/`）。
+此处仅保留机制说明：
 
-- `fec` = RS FEC 直连隧道;`prod` = 嵌套隧道(fec-tokyo + speederv2)。
-- 模式持久化在两端 `/etc/great-hole/fec/tunnel-mode`,up/down 脚本据此决定是否接管出口路由(防止机器重启后出口被错误改回)。
-- 固定 IP 两端用 `hole.udp` 直连;出口选择(osaka/tokyo)用 `scripts/switch-exit`。
+- 模式持久化在两端 `/etc/great-hole/fec/tunnel-mode`，up/down 脚本据此决定是否接管出口路由（防止机器重启后出口被错误改回）。
+- 固定 IP 的两端可用 `hole.udp` 直连；出口分 osaka/tokyo 两档。
 
 ### 7.4 经验教训速查
 
