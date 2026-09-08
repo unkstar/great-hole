@@ -141,7 +141,14 @@ bool RS256::Decode(const std::vector<std::vector<uint8_t>>& known, uint32_t T,
             if (inv[i][r]) { first = static_cast<int>(r); break; }
         }
         if (first < 0) continue;
-        std::memcpy(out, known[first].data(), T);
+        const uint8_t firstCoefficient = inv[i][first];
+        if (firstCoefficient == 1) {
+            std::memcpy(out, known[first].data(), T);
+        } else {
+            for (uint32_t b = 0; b < T; b++) {
+                out[b] = gf_mul(firstCoefficient, known[first][b]);
+            }
+        }
         for (size_t r = static_cast<size_t>(first) + 1; r < k; r++) {
             const uint8_t y = inv[i][r];
             if (y == 0) continue;

@@ -109,7 +109,7 @@ void RsCodec::EncodePacket(Packet&& p, std::vector<Packet>& out) {
         // redundancy copies: 1 + ceil(repeat_ratio), adapted like lcrq
         float adaptive_ratio = _Cfg.repeat_ratio;
         if (_OverheadCtrl) {
-            float oh = _OverheadCtrl->GetOverhead();
+            float oh = std::clamp(_OverheadCtrl->GetOverhead(), _Cfg.overhead, _Cfg.max_overhead);
             float frac = (oh - _Cfg.safety_margin) / (_Cfg.max_overhead - _Cfg.safety_margin);
             frac = std::clamp(frac, 0.0f, 1.0f);
             adaptive_ratio = _Cfg.repeat_ratio_min + (_Cfg.repeat_ratio_max - _Cfg.repeat_ratio_min) * frac;
@@ -136,7 +136,8 @@ void RsCodec::EncodePacket(Packet&& p, std::vector<Packet>& out) {
         op.PushFrontLE(static_cast<uint16_t>(dlen));
         op.PushFrontLE(fb);
         op.PushFrontLE(BuildDword(seq, 0));
-        const size_t pad = T - op.DataSize();
+        // T covers [length | payload | padding]; the wire prefix is 5 bytes.
+        const size_t pad = T + 5 - op.DataSize();
         if (pad > 0) {
             op._Data.resize(op._Offset + op._Length + pad);
             std::memset(op._Data.data() + op._Offset + op._Length, 0, pad);
@@ -172,6 +173,8 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
     if (k == 0) return;
     const uint32_t T = RsSymbolSize(_Cfg);
     float oh = _OverheadCtrl ? _OverheadCtrl->GetOverhead() : _Cfg.overhead;
+    // Enforce the configured repair floor for every adaptive algorithm.
+    oh = std::clamp(oh, _Cfg.overhead, _Cfg.max_overhead);
     if (_OverheadCtrl && _Shared) _OverheadCtrl->Update(_Shared->peer_loss_rate);
     // loss_deadband: while the measured loss sits at/below the configured
     // clean-link baseline, skip repairs entirely — ceil() quantization would
@@ -194,7 +197,10 @@ void RsCodec::SendRsRepair(const std::vector<Packet>& batch, uint32_t batch_star
     std::vector<std::vector<uint8_t>> srcv(k, std::vector<uint8_t>(T, 0));
     for (uint32_t i = 0; i < k; i++) {
         auto d = batch[i].Data();
-        std::memcpy(srcv[i].data(), d.data(), std::min<size_t>(d.size(), T));
+        // Repair the same length-prefixed representation cached by the decoder.
+        srcv[i][0] = static_cast<uint8_t>(d.size() & 0xFF);
+        srcv[i][1] = static_cast<uint8_t>((d.size() >> 8) & 0xFF);
+        std::memcpy(srcv[i].data() + 2, d.data(), d.size());
     }
     std::vector<std::vector<uint8_t>> repairs;
     RS256::EncodeRepair(srcv, T, RS256::BuildCoeffs(k, m), repairs);
@@ -280,6 +286,7 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
     if (p.DataSize() < 2) return;
     const uint16_t len = p.PopFrontLE<uint16_t>();
     if (len > p.DataSize()) return;
+    if (!(f & kRsSmall) && static_cast<uint32_t>(len) + 2 > T) return;
     if (f & kRsSmall) {
         // dedup: redundancy copies of the same small packet (identical
         // payload, back-to-back) must be delivered once, like the lcrq
@@ -332,7 +339,7 @@ void RsCodec::DecodePacket(Packet&& p, std::vector<Packet>& out) {
             _Stats->ReorderEarly();
         }
     }
-    if (slot.payload.size() != T) slot.payload.resize(T);
+    slot.payload.assign(T, 0);
     slot.payload[0] = static_cast<uint8_t>(len & 0xFF);
     slot.payload[1] = static_cast<uint8_t>((len >> 8) & 0xFF);
     std::memcpy(slot.payload.data() + 2, p.Data().data(), std::min<size_t>(len, p.DataSize()));
@@ -416,7 +423,7 @@ void RsCodec::RsTryRecover(uint32_t bid, uint32_t k, std::vector<Packet>& out) {
         rows.push_back(std::move(row));
     }
     const uint8_t* rep_data = rep.data.data();
-    for (uint32_t j = 0; j < k && known.size() < k; j++) {
+    for (uint32_t j = 0; j < rep.mask.size() * 8 && known.size() < k; j++) {
         if (!(rep.mask[j >> 3] & (1u << (j & 7)))) continue;  // never received
         const size_t off = static_cast<size_t>(j) * T;
         if (off + T > rep.data.size()) continue;
