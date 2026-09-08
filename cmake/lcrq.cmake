@@ -23,7 +23,8 @@ ExternalProject_Add(lcrq_ext
     PREFIX ${LCRQ_PREFIX}
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND ${LCRQ_SRC}/configure
-    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -C src
+    # Building src directly bypasses the top-level Makefile's default -O2.
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env "CFLAGS=-O3 -DNDEBUG" ${CMAKE_MAKE_PROGRAM} -C src
     INSTALL_COMMAND /bin/sh ${CMAKE_CURRENT_SOURCE_DIR}/cmake/lcrq-install.sh ${LCRQ_INSTALL_DIR} ${CMAKE_AR}
     BUILD_BYPRODUCTS ${LCRQ_INSTALL_DIR}/lib/liblcrq.a
 )
